@@ -14,7 +14,11 @@ function optional(name: string, fallback = ''): string {
 
 export const env = {
   port: Number(process.env.PORT ?? 4000),
-  frontendUrl: optional('FRONTEND_URL', 'http://localhost:5173'),
+  // Accept a comma-separated list so both localhost and the Vercel URL work.
+  frontendUrls: optional('FRONTEND_URL', 'http://localhost:5173')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
   jwtSecret: required('JWT_SECRET'),
   databaseUrl: required('DATABASE_URL'),
   r2: {

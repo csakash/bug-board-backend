@@ -11,9 +11,18 @@ import { uploadsRouter } from './routes/uploads.js';
 
 const app = express();
 
+const allowedOrigins = new Set(env.frontendUrls);
+
 app.use(
   cors({
-    origin: env.frontendUrl,
+    origin: (origin, callback) => {
+      // Allow server-to-server calls (no origin) and all listed front-ends.
+      if (!origin || allowedOrigins.has(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS: origin '${origin}' not allowed`));
+      }
+    },
     credentials: true,
   }),
 );
@@ -33,6 +42,11 @@ app.use('/api', chatRouter);
 app.use(notFound);
 app.use(errorHandler);
 
-app.listen(env.port, () => {
-  console.log(`bugbot-backend listening on http://localhost:${env.port}`);
-});
+// In Vercel serverless the module is imported as a handler — do not bind a port.
+if (!process.env.VERCEL) {
+  app.listen(env.port, () => {
+    console.log(`bugbot-backend listening on http://localhost:${env.port}`);
+  });
+}
+
+export default app;

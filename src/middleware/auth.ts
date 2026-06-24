@@ -30,11 +30,14 @@ export function signToken(user: AuthUser): string {
   return jwt.sign(user, env.jwtSecret, { expiresIn: '7d' });
 }
 
+const isProd = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+
 export function setAuthCookie(res: Response, token: string): void {
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    // Cross-origin Vercel deployments (different subdomains) require SameSite=None + Secure.
+    sameSite: isProd ? 'none' : 'lax',
+    secure: isProd,
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 }
