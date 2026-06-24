@@ -12,10 +12,15 @@ function optional(name: string, fallback = ''): string {
   return process.env[name] ?? fallback;
 }
 
+const defaultFrontendUrls = [
+  'http://localhost:5173',
+  'https://bug-board-frontend.vercel.app',
+].join(',');
+
 export const env = {
   port: Number(process.env.PORT ?? 4000),
   // Accept a comma-separated list so both localhost and the Vercel URL work.
-  frontendUrls: optional('FRONTEND_URL', 'http://localhost:5173')
+  frontendUrls: optional('FRONTEND_URL', defaultFrontendUrls)
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
