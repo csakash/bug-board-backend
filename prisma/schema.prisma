@@ -1,0 +1,412 @@
+// Bug Board — Prisma schema (Neon Postgres)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  owner
+  admin
+  member
+  viewer
+}
+
+enum ContextStatus {
+  pending
+  generating
+  ready
+  failed
+}
+
+enum IssueType {
+  bug
+  feature
+  improvement
+  task
+  regression
+  investigation
+  design
+  documentation
+  support
+  question
+}
+
+enum IssueStatus {
+  open
+  in_progress
+  resolved
+}
+
+enum Severity {
+  low
+  medium
+  high
+  critical
+}
+
+enum Priority {
+  low
+  medium
+  high
+  urgent
+}
+
+enum IssueSource {
+  manual
+  ai_chat
+  import
+  api
+}
+
+enum RelationType {
+  related
+  duplicate
+  blocks
+  blocked_by
+  caused_by
+}
+
+enum FilePurpose {
+  context
+  screenshot
+  video
+  log
+  document
+  attachment
+}
+
+enum ReviewState {
+  commented
+  approved
+  requested_changes
+}
+
+enum ChatRole {
+  user
+  assistant
+  system
+}
+
+enum SuggestionStatus {
+  draft
+  accepted
+  dismissed
+}
+
+// ---------- Core ----------
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  password  String
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   WorkspaceMember[]
+  createdProjects Project[]      @relation("ProjectCreatedBy")
+  reportedIssues  Issue[]        @relation("IssueReporter")
+  assignedIssues  Issue[]        @relation("IssueAssignee")
+  uploadedFiles   File[]
+  comments        Comment[]
+  chatThreads     ChatThread[]
+  suggestions     IssueSuggestion[]
+  activityEvents  ActivityEvent[]
+}
+
+model Workspace {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members  WorkspaceMember[]
+  projects Project[]
+  files    File[]
+}
+
+model WorkspaceMember {
+  id          String    @id @default(uuid())
+  workspaceId String
+  userId      String
+  role        Role      @default(member)
+  createdAt   DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+model Project {
+  id            String        @id @default(uuid())
+  workspaceId   String
+  name          String
+  key           String
+  description   String
+  color         String?
+  contextStatus ContextStatus @default(pending)
+  issueCounter  Int           @default(0)
+  createdById   String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User?     @relation("ProjectCreatedBy", fields: [createdById], references: [id])
+
+  context    ProjectContext?
+  issues     Issue[]
+  labels     Label[]
+  files      ProjectFile[]
+  threads    ChatThread[]
+  suggestions IssueSuggestion[]
+  relations  IssueRelation[]
+  activity   ActivityEvent[]
+
+  @@unique([workspaceId, key])
+  @@index([workspaceId, createdAt])
+}
+
+model ProjectContext {
+  id                 String   @id @default(uuid())
+  projectId          String   @unique
+  summary            String
+  audience           String?
+  terminology        Json     @default("[]")
+  flows              Json     @default("[]")
+  components         Json     @default("[]")
+  suggestedLabels    Json     @default("[]")
+  suggestedTemplates Json     @default("[]")
+  risks              Json     @default("[]")
+  openQuestions      Json     @default("[]")
+  sourceFileIds      String[] @default([])
+  model              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Issues ----------
+
+model Issue {
+  id                String      @id @default(uuid())
+  projectId         String
+  issueNumber       Int
+  issueKey          String
+  type              IssueType   @default(bug)
+  title             String
+  description       String
+  status            IssueStatus @default(open)
+  severity          Severity?
+  priority          Priority?
+  environment       String?
+  expectedResult    String?
+  actualResult      String?
+  acceptanceCriteria Json       @default("[]")
+  stepsToReproduce  Json        @default("[]")
+  reporterId        String?
+  assigneeId        String?
+  source            IssueSource @default(manual)
+  aiConfidence      Float?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  project  Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  reporter User?   @relation("IssueReporter", fields: [reporterId], references: [id])
+  assignee User?   @relation("IssueAssignee", fields: [assigneeId], references: [id])
+
+  labels        IssueLabel[]
+  files         IssueFile[]
+  comments      Comment[]
+  activity      ActivityEvent[]
+  relationsFrom IssueRelation[] @relation("RelationSource")
+  relationsTo   IssueRelation[] @relation("RelationTarget")
+  fromSuggestion IssueSuggestion?
+
+  @@unique([projectId, issueNumber])
+  @@unique([projectId, issueKey])
+  @@index([projectId, status, createdAt])
+  @@index([reporterId])
+}
+
+model Label {
+  id        String   @id @default(uuid())
+  projectId String
+  name      String
+  color     String?
+  createdAt DateTime @default(now())
+
+  project Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  issues  IssueLabel[]
+
+  @@unique([projectId, name])
+}
+
+model IssueLabel {
+  issueId String
+  labelId String
+
+  issue Issue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  label Label @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([issueId, labelId])
+}
+
+model IssueRelation {
+  id            String       @id @default(uuid())
+  projectId     String
+  sourceIssueId String
+  targetIssueId String
+  relationType  RelationType @default(related)
+  confidence    Float?
+  createdAt     DateTime     @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source  Issue   @relation("RelationSource", fields: [sourceIssueId], references: [id], onDelete: Cascade)
+  target  Issue   @relation("RelationTarget", fields: [targetIssueId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceIssueId, targetIssueId, relationType])
+}
+
+// ---------- Files ----------
+
+model File {
+  id            String   @id @default(uuid())
+  workspaceId   String
+  uploadedById  String?
+  bucket        String
+  objectKey     String
+  fileName      String
+  contentType   String
+  sizeBytes     BigInt   @default(0)
+  checksum      String?
+  extractedText String?
+  metadata      Json     @default("{}")
+  createdAt     DateTime @default(now())
+
+  workspace  Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  uploadedBy User?     @relation(fields: [uploadedById], references: [id])
+
+  projects ProjectFile[]
+  issues   IssueFile[]
+
+  @@unique([bucket, objectKey])
+  @@index([workspaceId, createdAt])
+}
+
+model ProjectFile {
+  projectId String
+  fileId    String
+  purpose   FilePurpose @default(context)
+  createdAt DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  file    File    @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, fileId])
+}
+
+model IssueFile {
+  issueId   String
+  fileId    String
+  purpose   FilePurpose @default(attachment)
+  createdAt DateTime    @default(now())
+
+  issue Issue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  file  File  @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@id([issueId, fileId])
+}
+
+// ---------- Chat / Suggestions / Comments / Activity ----------
+
+model ChatThread {
+  id        String   @id @default(uuid())
+  projectId String
+  userId    String?
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project     Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user        User?             @relation(fields: [userId], references: [id])
+  messages    ChatMessage[]
+  suggestions IssueSuggestion[]
+
+  @@index([projectId, userId, createdAt])
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  threadId  String
+  role      ChatRole
+  content   String
+  fileIds   String[] @default([])
+  createdAt DateTime @default(now())
+
+  thread ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+}
+
+model IssueSuggestion {
+  id             String           @id @default(uuid())
+  projectId      String
+  threadId       String?
+  createdById    String?
+  draft          Json
+  status         SuggestionStatus @default(draft)
+  confidence     Float?
+  createdIssueId String?          @unique
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  project      Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  thread       ChatThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+  createdBy    User?       @relation(fields: [createdById], references: [id])
+  createdIssue Issue?      @relation(fields: [createdIssueId], references: [id])
+
+  @@index([projectId, createdAt])
+}
+
+model Comment {
+  id          String       @id @default(uuid())
+  issueId     String
+  authorId    String?
+  body        String
+  reviewState ReviewState?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  issue  Issue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  author User? @relation(fields: [authorId], references: [id])
+
+  @@index([issueId, createdAt])
+}
+
+model ActivityEvent {
+  id        String   @id @default(uuid())
+  projectId String
+  issueId   String?
+  actorId   String?
+  eventType String
+  payload   Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  issue   Issue?  @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  actor   User?   @relation(fields: [actorId], references: [id])
+
+  @@index([projectId, createdAt])
+  @@index([issueId, createdAt])
+}
