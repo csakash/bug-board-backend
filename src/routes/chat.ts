@@ -3,26 +3,102 @@ import { z } from 'zod';
 import { prisma } from '../db/client.js';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
-import { generateIssueSuggestion } from '../services/gemini.js';
+import { generateAgentReply, type AgentTurn } from '../services/gemini.js';
+import { buildProjectIntel } from '../services/project-intel.js';
 import { createIssue } from '../services/issues.js';
 
 export const chatRouter = Router();
 chatRouter.use(requireAuth);
 
-async function getOrCreateThread(projectId: string, userId: string) {
+function deriveThreadTitle(message: string): string {
+  const trimmed = message.trim().replace(/\s+/g, ' ');
+  return trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed || 'New chat';
+}
+
+// Ensure the user has at least one thread for this project, returning the most recent.
+async function getOrCreateActiveThread(projectId: string, userId: string) {
   const existing = await prisma.chatThread.findFirst({
     where: { projectId, userId },
-    orderBy: { createdAt: 'desc' },
+    orderBy: { updatedAt: 'desc' },
   });
   if (existing) return existing;
   return prisma.chatThread.create({ data: { projectId, userId } });
 }
 
-// Fetch chat history for the project's thread.
+// Load a thread and verify it belongs to the caller and the active workspace.
+async function loadOwnedThread(threadId: string, req: AuthedRequest) {
+  const thread = await prisma.chatThread.findUnique({
+    where: { id: threadId },
+    include: { project: { select: { workspaceId: true } } },
+  });
+  if (
+    !thread ||
+    thread.userId !== req.user!.id ||
+    thread.project.workspaceId !== req.workspaceId
+  ) {
+    throw new HttpError(404, 'Conversation not found');
+  }
+  return thread;
+}
+
+// List the user's conversations for a project (ensures at least one exists).
 chatRouter.get(
-  '/projects/:projectId/chat/messages',
+  '/projects/:projectId/chat/threads',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const thread = await getOrCreateThread(req.params.projectId, req.user!.id);
+    const project = await prisma.project.findFirst({
+      where: { id: req.params.projectId, workspaceId: req.workspaceId },
+      select: { id: true },
+    });
+    if (!project) throw new HttpError(404, 'Project not found');
+
+    await getOrCreateActiveThread(project.id, req.user!.id);
+
+    const threads = await prisma.chatThread.findMany({
+      where: { projectId: project.id, userId: req.user!.id },
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        title: true,
+        updatedAt: true,
+        _count: { select: { messages: true } },
+      },
+    });
+
+    res.json({
+      threads: threads.map((t) => ({
+        id: t.id,
+        title: t.title,
+        updatedAt: t.updatedAt,
+        messageCount: t._count.messages,
+      })),
+    });
+  }),
+);
+
+// Start a fresh conversation.
+chatRouter.post(
+  '/projects/:projectId/chat/threads',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const project = await prisma.project.findFirst({
+      where: { id: req.params.projectId, workspaceId: req.workspaceId },
+      select: { id: true },
+    });
+    if (!project) throw new HttpError(404, 'Project not found');
+
+    const thread = await prisma.chatThread.create({
+      data: { projectId: project.id, userId: req.user!.id },
+    });
+    res.status(201).json({
+      thread: { id: thread.id, title: thread.title, updatedAt: thread.updatedAt, messageCount: 0 },
+    });
+  }),
+);
+
+// Fetch messages for a specific conversation.
+chatRouter.get(
+  '/chat/threads/:threadId/messages',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const thread = await loadOwnedThread(req.params.threadId, req);
     const messages = await prisma.chatMessage.findMany({
       where: { threadId: thread.id },
       orderBy: { createdAt: 'asc' },
@@ -36,18 +112,28 @@ const messageSchema = z.object({
   fileIds: z.array(z.string().uuid()).default([]),
 });
 
-// Post a user message and get back an AI-generated suggested issue card.
+// Post a user message to a conversation. The agent replies with full thread
+// history and live project data, and only drafts an issue card when warranted.
 chatRouter.post(
-  '/projects/:projectId/chat/messages',
+  '/chat/threads/:threadId/messages',
   asyncHandler(async (req: AuthedRequest, res) => {
+    const thread = await loadOwnedThread(req.params.threadId, req);
     const project = await prisma.project.findFirst({
-      where: { id: req.params.projectId, workspaceId: req.workspaceId },
+      where: { id: thread.projectId, workspaceId: req.workspaceId },
       include: { context: true, labels: true },
     });
     if (!project) throw new HttpError(404, 'Project not found');
 
     const { content, fileIds } = messageSchema.parse(req.body);
-    const thread = await getOrCreateThread(project.id, req.user!.id);
+
+    const priorMessages = await prisma.chatMessage.findMany({
+      where: { threadId: thread.id },
+      orderBy: { createdAt: 'asc' },
+      select: { role: true, content: true },
+    });
+    const history: AgentTurn[] = priorMessages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
     await prisma.chatMessage.create({
       data: { threadId: thread.id, role: 'user', content, fileIds },
@@ -62,35 +148,50 @@ chatRouter.post(
       ? `${project.context.summary}\nComponents: ${(project.context.components as string[]).join(', ')}`
       : project.description;
 
-    const suggestion = await generateIssueSuggestion({
-      message: content,
+    const projectIntel = await buildProjectIntel(project.id);
+
+    const agent = await generateAgentReply({
+      history,
+      userMessage: content,
       projectContext: contextText,
+      projectIntel,
       existingLabels: project.labels.map((l) => l.name),
       fileSummaries,
     });
 
-    const draft = { ...suggestion, fileIds };
-    const record = await prisma.issueSuggestion.create({
-      data: {
-        projectId: project.id,
-        threadId: thread.id,
-        createdById: req.user!.id,
-        draft,
-        confidence: suggestion.confidence,
-      },
-    });
+    let suggestionPayload: { id: string; draft: Record<string, unknown>; confidence: number | null } | null =
+      null;
 
-    const assistantText = suggestion.clarifyingQuestions.length
-      ? `I drafted a card, but a couple of things would help: ${suggestion.clarifyingQuestions.join(' ')}`
-      : 'Here is a structured issue card I drafted from that. Review it, then add it to the board when it looks right.';
+    if (agent.shouldDraftIssue && agent.issue) {
+      const draft = { ...agent.issue, fileIds };
+      const record = await prisma.issueSuggestion.create({
+        data: {
+          projectId: project.id,
+          threadId: thread.id,
+          createdById: req.user!.id,
+          draft,
+          confidence: agent.issue.confidence,
+        },
+      });
+      suggestionPayload = { id: record.id, draft, confidence: agent.issue.confidence };
+    }
 
     await prisma.chatMessage.create({
-      data: { threadId: thread.id, role: 'assistant', content: assistantText },
+      data: { threadId: thread.id, role: 'assistant', content: agent.reply },
+    });
+
+    // Title the thread from its first user message, and bump its updatedAt.
+    const title = thread.title ?? deriveThreadTitle(content);
+    await prisma.chatThread.update({
+      where: { id: thread.id },
+      data: { title, updatedAt: new Date() },
     });
 
     res.status(201).json({
-      message: assistantText,
-      suggestion: { id: record.id, draft, confidence: suggestion.confidence },
+      threadId: thread.id,
+      message: agent.reply,
+      suggestion: suggestionPayload,
+      title,
     });
   }),
 );
