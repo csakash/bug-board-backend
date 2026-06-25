@@ -302,6 +302,31 @@ projectsRouter.patch(
   }),
 );
 
+projectsRouter.delete(
+  '/:projectId',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const workspaceId = req.workspaceId;
+    if (!workspaceId) throw new HttpError(400, 'No workspace');
+
+    const project = await prisma.project.findFirst({
+      where: { id: req.params.projectId, workspaceId },
+      select: { id: true },
+    });
+    if (!project) throw new HttpError(404, 'Project not found');
+
+    // Related rows (issues, labels, files, threads, context, suggestions,
+    // relations, activity) cascade via the schema's onDelete: Cascade.
+    await prisma.project.delete({ where: { id: project.id } });
+
+    invalidateCache(`workspace:${workspaceId}:projects`);
+    invalidateCache(`workspace:${workspaceId}:project:${project.id}`);
+    invalidateCache(`workspace:${workspaceId}:project:${project.id}:issues`);
+    invalidateCache(`project:${project.id}:context`);
+
+    res.json({ ok: true });
+  }),
+);
+
 projectsRouter.get(
   '/:projectId/context',
   asyncHandler(async (req: AuthedRequest, res) => {

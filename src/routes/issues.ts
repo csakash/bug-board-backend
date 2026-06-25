@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db/client.js';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
@@ -130,6 +131,70 @@ issuesRouter.post(
       invalidateCache(`workspace:${req.workspaceId}:project:${project.id}:issues`);
     }
     res.status(201).json({ issue });
+  }),
+);
+
+// Search issues across every project in the workspace. Matches on title,
+// issue key, and keyword aliases for severity / status / type.
+const SEVERITY_VALUES = ['low', 'medium', 'high', 'critical'] as const;
+const ISSUE_TYPE_VALUES = [
+  'bug',
+  'feature',
+  'improvement',
+  'task',
+  'regression',
+  'investigation',
+  'design',
+  'documentation',
+  'support',
+  'question',
+] as const;
+
+function matchStatus(q: string): 'open' | 'in_progress' | 'resolved' | null {
+  if (q === 'open') return 'open';
+  if (['in_progress', 'in progress', 'progress', 'inprogress'].includes(q)) return 'in_progress';
+  if (['resolved', 'done', 'closed', 'complete', 'completed'].includes(q)) return 'resolved';
+  return null;
+}
+
+issuesRouter.get(
+  '/search/issues',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const workspaceId = req.workspaceId;
+    if (!workspaceId) throw new HttpError(400, 'No workspace');
+
+    const q = String(req.query.q ?? '').trim();
+    if (!q) {
+      res.json({ issues: [] });
+      return;
+    }
+
+    const lower = q.toLowerCase();
+    const or: Prisma.IssueWhereInput[] = [
+      { title: { contains: q, mode: 'insensitive' } },
+      { issueKey: { contains: q, mode: 'insensitive' } },
+    ];
+
+    if ((SEVERITY_VALUES as readonly string[]).includes(lower)) {
+      or.push({ severity: lower as Prisma.IssueWhereInput['severity'] });
+    }
+    const status = matchStatus(lower);
+    if (status) or.push({ status });
+    if ((ISSUE_TYPE_VALUES as readonly string[]).includes(lower)) {
+      or.push({ type: lower as Prisma.IssueWhereInput['type'] });
+    }
+
+    const issues = await prisma.issue.findMany({
+      where: { project: { workspaceId }, OR: or },
+      orderBy: { createdAt: 'desc' },
+      take: 40,
+      select: {
+        ...boardIssueSelect,
+        project: { select: { id: true, key: true, name: true, color: true } },
+      },
+    });
+
+    res.json({ issues: issues.map(serializeIssue) });
   }),
 );
 
