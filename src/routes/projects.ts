@@ -223,7 +223,24 @@ projectsRouter.get(
       async () =>
         prisma.project.findFirst({
           where: { id: req.params.projectId, workspaceId },
-          include: { context: true, labels: true },
+          include: {
+            context: true,
+            labels: true,
+            files: {
+              orderBy: { createdAt: 'asc' },
+              include: {
+                file: {
+                  select: {
+                    id: true,
+                    fileName: true,
+                    contentType: true,
+                    sizeBytes: true,
+                    createdAt: true,
+                  },
+                },
+              },
+            },
+          },
         }),
     );
     if (!project) throw new HttpError(404, 'Project not found');
