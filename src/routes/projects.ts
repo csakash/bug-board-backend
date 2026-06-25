@@ -99,11 +99,18 @@ async function runContextGeneration(projectId: string): Promise<void> {
       where: { id: projectId },
       data: { contextStatus: 'ready' },
     });
+
+    invalidateCache(`workspace:${project.workspaceId}:projects`);
+    invalidateCache(`workspace:${project.workspaceId}:project:${project.id}`);
   } catch (err) {
     console.error('Context generation failed:', err);
-    await prisma.project
+    const failedProject = await prisma.project
       .update({ where: { id: projectId }, data: { contextStatus: 'failed' } })
       .catch(() => undefined);
+    if (failedProject) {
+      invalidateCache(`workspace:${failedProject.workspaceId}:projects`);
+      invalidateCache(`workspace:${failedProject.workspaceId}:project:${failedProject.id}`);
+    }
   }
 }
 
@@ -126,6 +133,7 @@ projectsRouter.get(
           description: true,
           color: true,
           contextStatus: true,
+          context: { select: { summary: true } },
           _count: { select: { issues: true } },
         },
       });
@@ -148,6 +156,7 @@ projectsRouter.get(
         name: p.name,
         key: p.key,
         description: p.description,
+        summary: p.context?.summary ?? null,
         color: p.color,
         contextStatus: p.contextStatus,
         issueCount: p._count.issues,
