@@ -15,6 +15,47 @@ function deriveThreadTitle(message: string): string {
   return trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed || 'New chat';
 }
 
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value) ? (value as unknown[]).map((v) => String(v)) : [];
+}
+
+// Build a complete, readable project-context block so the assistant always has
+// the full picture when chatting or drafting an issue.
+function formatProjectContext(context: {
+  summary: string;
+  audience: string | null;
+  components: unknown;
+  flows: unknown;
+  terminology: unknown;
+  risks: unknown;
+  openQuestions: unknown;
+  suggestedLabels: unknown;
+}): string {
+  const sections: string[] = [`Summary: ${context.summary}`];
+  if (context.audience) sections.push(`Audience: ${context.audience}`);
+
+  const components = asStringList(context.components);
+  if (components.length) sections.push(`Components: ${components.join(', ')}`);
+
+  const flows = asStringList(context.flows);
+  if (flows.length) sections.push(`Key flows:\n${flows.map((f) => `- ${f}`).join('\n')}`);
+
+  const terminology = asStringList(context.terminology);
+  if (terminology.length) sections.push(`Terminology: ${terminology.join(', ')}`);
+
+  const risks = asStringList(context.risks);
+  if (risks.length) sections.push(`Known risks:\n${risks.map((r) => `- ${r}`).join('\n')}`);
+
+  const openQuestions = asStringList(context.openQuestions);
+  if (openQuestions.length)
+    sections.push(`Open questions:\n${openQuestions.map((q) => `- ${q}`).join('\n')}`);
+
+  const suggestedLabels = asStringList(context.suggestedLabels);
+  if (suggestedLabels.length) sections.push(`Suggested labels: ${suggestedLabels.join(', ')}`);
+
+  return sections.join('\n\n');
+}
+
 // Ensure the user has at least one thread for this project, returning the most recent.
 async function getOrCreateActiveThread(projectId: string, userId: string) {
   const existing = await prisma.chatThread.findFirst({
@@ -145,7 +186,7 @@ chatRouter.post(
     const fileSummaries = files.map((f) => `${f.fileName} (${f.contentType})`);
 
     const contextText = project.context
-      ? `${project.context.summary}\nComponents: ${(project.context.components as string[]).join(', ')}`
+      ? formatProjectContext(project.context)
       : project.description;
 
     const projectIntel = await buildProjectIntel(project.id);
