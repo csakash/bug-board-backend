@@ -46,6 +46,9 @@ const ISSUE_TYPES = [
   'question',
 ];
 
+const SEVERITIES = ['low', 'medium', 'high', 'critical'];
+const PRIORITIES = ['low', 'medium', 'high', 'urgent'];
+
 function extractJson<T>(text: string): T {
   // Models sometimes wrap JSON in ```json fences — strip them.
   const cleaned = text
@@ -342,6 +345,209 @@ Return ONLY a JSON object with this exact shape:
         "I had trouble processing that just now. Could you rephrase, or tell me what you'd like to do?",
       shouldDraftIssue: false,
       issue: null,
+    };
+  }
+}
+
+// ---------- Issue-scoped agent ----------
+
+// Fields the issue agent is allowed to propose changing. Mirrors the editable
+// columns on Issue that the PATCH /issues/:id endpoint accepts.
+export interface IssueFieldPatch {
+  title?: string;
+  description?: string;
+  type?: string;
+  status?: 'open' | 'in_progress' | 'resolved';
+  severity?: string | null;
+  priority?: string | null;
+  environment?: string | null;
+  expectedResult?: string | null;
+  actualResult?: string | null;
+  stepsToReproduce?: string[];
+  acceptanceCriteria?: string[];
+}
+
+export type IssueAction =
+  | { kind: 'update_fields'; summary: string; fields: IssueFieldPatch }
+  | { kind: 'post_comment'; summary: string; comment: string };
+
+export interface IssueAgentReplyResult {
+  reply: string;
+  action: IssueAction | null;
+}
+
+const ALLOWED_PATCH_KEYS: (keyof IssueFieldPatch)[] = [
+  'title',
+  'description',
+  'type',
+  'status',
+  'severity',
+  'priority',
+  'environment',
+  'expectedResult',
+  'actualResult',
+  'stepsToReproduce',
+  'acceptanceCriteria',
+];
+
+// Keep only recognized keys and coerce the two array fields, so a malformed
+// model response can never smuggle arbitrary columns into the PATCH.
+function sanitizeFieldPatch(raw: unknown): IssueFieldPatch {
+  const out: IssueFieldPatch = {};
+  if (!raw || typeof raw !== 'object') return out;
+  const obj = raw as Record<string, unknown>;
+  for (const key of ALLOWED_PATCH_KEYS) {
+    if (!(key in obj) || obj[key] === undefined) continue;
+    const value = obj[key];
+    if (key === 'stepsToReproduce' || key === 'acceptanceCriteria') {
+      if (Array.isArray(value)) {
+        out[key] = value.map((v) => String(v)).filter((v) => v.trim().length > 0);
+      }
+    } else if (key === 'type') {
+      if (ISSUE_TYPES.includes(String(value))) out.type = String(value);
+    } else if (key === 'status') {
+      if (['open', 'in_progress', 'resolved'].includes(String(value))) {
+        out.status = String(value) as IssueFieldPatch['status'];
+      }
+    } else if (key === 'severity') {
+      if (value === null) out.severity = null;
+      else if (SEVERITIES.includes(String(value))) out.severity = String(value);
+    } else if (key === 'priority') {
+      if (value === null) out.priority = null;
+      else if (PRIORITIES.includes(String(value))) out.priority = String(value);
+    } else {
+      // scalar string fields: title, description, environment, expected/actual.
+      // Only accept genuine strings or explicit null; never coerce objects/arrays,
+      // and never blank the title.
+      if (value === null) {
+        // Only the nullable scalars may be cleared; ignore null for title/description.
+        if (key === 'environment' || key === 'expectedResult' || key === 'actualResult') {
+          out[key] = null;
+        }
+      } else if (typeof value === 'string') {
+        if (key === 'title' && value.trim().length === 0) continue;
+        out[key] = value;
+      }
+    }
+  }
+  return out;
+}
+
+function normalizeIssueAction(raw: unknown): IssueAction | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
+  if (obj.kind === 'post_comment') {
+    const comment = typeof obj.comment === 'string' ? obj.comment.trim() : '';
+    if (!comment) return null;
+    return { kind: 'post_comment', summary: summary || 'Post this comment on the issue.', comment };
+  }
+  if (obj.kind === 'update_fields') {
+    const fields = sanitizeFieldPatch(obj.fields);
+    if (Object.keys(fields).length === 0) return null;
+    return {
+      kind: 'update_fields',
+      summary: summary || 'Apply these field updates to the issue.',
+      fields,
+    };
+  }
+  return null;
+}
+
+// Conversational agent scoped to a SINGLE issue. It answers questions about the
+// open issue and its discussion, and — only when the user asks to change the
+// issue or add a comment — returns ONE proposed action the user confirms in the
+// UI. It never drafts a separate new issue card.
+export async function generateIssueAgentReply(input: {
+  history: AgentTurn[];
+  userMessage: string;
+  projectContext: string;
+  issueIntel: string;
+}): Promise<IssueAgentReplyResult> {
+  if (!genAI) {
+    return {
+      reply:
+        'AI is not configured in this environment, so I can’t analyze this issue right now. Set GEMINI_API_KEY to enable the assistant.',
+      action: null,
+    };
+  }
+
+  const model = genAI.getGenerativeModel({ model: env.gemini.model });
+  const historyText =
+    input.history
+      .map((turn) => `${turn.role === 'user' ? 'User' : 'Assistant'}: ${turn.content}`)
+      .join('\n') || '(no earlier messages)';
+
+  const prompt = `You are Bugbot, an AI assistant embedded inside ONE specific issue of an issue tracker.
+Your entire context is the single issue described under ISSUE DATA. Answer about THIS issue.
+
+You can:
+- Answer questions and summarize this issue and its discussion using ISSUE DATA.
+- When the user asks you to improve/change the issue, propose ONE "update_fields" action with only the fields that should change (e.g. sharper stepsToReproduce, clearer description, tighter acceptanceCriteria, a corrected severity/status/priority/type).
+- When the user asks you to add a comment / reply on the issue, propose ONE "post_comment" action.
+
+Behaviour rules:
+- ALWAYS write a helpful, conversational "reply" that addresses the user's latest message, using ISSUE DATA and the conversation so far.
+- Propose an action ONLY when the user clearly wants to change the issue or post a comment. Otherwise set action=null and just answer in "reply".
+- Never invent a brand-new separate issue; you only ever act on THIS issue.
+- For update_fields, include ONLY the keys that change. For array fields (stepsToReproduce, acceptanceCriteria) return the FULL new list, not a diff.
+- Keep "summary" a one-line plain-English description of what the action will do, since the user sees it on a confirm button.
+- For issue "type", choose from: ${ISSUE_TYPES.join(', ')}. For "status", use: open, in_progress, resolved.
+
+PROJECT CONTEXT:
+${input.projectContext || 'none provided'}
+
+ISSUE DATA:
+${input.issueIntel}
+
+CONVERSATION SO FAR:
+${historyText}
+
+NEW USER MESSAGE:
+"""
+${input.userMessage}
+"""
+
+Return ONLY a JSON object with this exact shape:
+{
+  "reply": string,
+  "action": null | {
+    "kind": "update_fields",
+    "summary": string,
+    "fields": {
+      "title"?: string,
+      "description"?: string,
+      "type"?: string,
+      "status"?: "open" | "in_progress" | "resolved",
+      "severity"?: "low" | "medium" | "high" | "critical" | null,
+      "priority"?: "low" | "medium" | "high" | "urgent" | null,
+      "environment"?: string | null,
+      "expectedResult"?: string | null,
+      "actualResult"?: string | null,
+      "stepsToReproduce"?: string[],
+      "acceptanceCriteria"?: string[]
+    }
+  } | {
+    "kind": "post_comment",
+    "summary": string,
+    "comment": string
+  }
+}`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    const parsed = extractJson<{ reply?: string; action?: unknown }>(result.response.text());
+    const reply =
+      typeof parsed.reply === 'string' && parsed.reply.trim()
+        ? parsed.reply.trim()
+        : 'Here is what I found.';
+    return { reply, action: normalizeIssueAction(parsed.action) };
+  } catch (err) {
+    console.error('generateIssueAgentReply failed:', err);
+    return {
+      reply:
+        "I had trouble analyzing this issue just now. Could you rephrase, or tell me what you'd like to do?",
+      action: null,
     };
   }
 }

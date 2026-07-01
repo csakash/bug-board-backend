@@ -47,6 +47,16 @@ export async function getDownloadUrl(objectKey) {
     });
     return getSignedUrl(client, command, { expiresIn: 60 * 60 });
 }
+// Read the raw bytes of a stored object (used for multimodal AI context generation).
+export async function getObjectBytes(objectKey) {
+    if (!client)
+        throw new Error('R2 not configured');
+    const result = await client.send(new GetObjectCommand({ Bucket: env.r2.bucket, Key: objectKey }));
+    const body = result.Body;
+    if (!body?.transformToByteArray)
+        throw new Error('Unable to read object body');
+    return Buffer.from(await body.transformToByteArray());
+}
 export async function deleteObject(objectKey) {
     if (!client)
         throw new Error('R2 not configured');

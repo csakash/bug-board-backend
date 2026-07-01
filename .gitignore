@@ -1,1 +1,5 @@
 node_modules/
+# Local env (contains secrets; copied per-worktree by loop-new)
+.env
+.env.*
+!.env.example
