@@ -233,6 +233,7 @@ model Issue {
   relationsFrom IssueRelation[] @relation("RelationSource")
   relationsTo   IssueRelation[] @relation("RelationTarget")
   fromSuggestion IssueSuggestion?
+  chatThreads    ChatThread[]
 
   @@unique([projectId, issueNumber])
   @@unique([projectId, issueKey])
@@ -334,17 +335,20 @@ model IssueFile {
 model ChatThread {
   id        String   @id @default(uuid())
   projectId String
+  issueId   String?
   userId    String?
   title     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   project     Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  issue       Issue?            @relation(fields: [issueId], references: [id], onDelete: Cascade)
   user        User?             @relation(fields: [userId], references: [id])
   messages    ChatMessage[]
   suggestions IssueSuggestion[]
 
   @@index([projectId, userId, createdAt])
+  @@index([issueId, userId, updatedAt])
 }
 
 model ChatMessage {

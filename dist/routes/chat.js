@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { prisma } from '../db/client.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
-import { generateAgentReply } from '../services/gemini.js';
-import { buildProjectIntel } from '../services/project-intel.js';
+import { generateAgentReply, generateIssueAgentReply, } from '../services/gemini.js';
+import { buildProjectIntel, buildIssueIntel } from '../services/project-intel.js';
 import { createIssue } from '../services/issues.js';
 export const chatRouter = Router();
 chatRouter.use(requireAuth);
@@ -12,15 +12,66 @@ function deriveThreadTitle(message) {
     const trimmed = message.trim().replace(/\s+/g, ' ');
     return trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed || 'New chat';
 }
-// Ensure the user has at least one thread for this project, returning the most recent.
+function asStringList(value) {
+    return Array.isArray(value) ? value.map((v) => String(v)) : [];
+}
+// Build a complete, readable project-context block so the assistant always has
+// the full picture when chatting or drafting an issue.
+function formatProjectContext(context) {
+    const sections = [`Summary: ${context.summary}`];
+    if (context.audience)
+        sections.push(`Audience: ${context.audience}`);
+    const components = asStringList(context.components);
+    if (components.length)
+        sections.push(`Components: ${components.join(', ')}`);
+    const flows = asStringList(context.flows);
+    if (flows.length)
+        sections.push(`Key flows:\n${flows.map((f) => `- ${f}`).join('\n')}`);
+    const terminology = asStringList(context.terminology);
+    if (terminology.length)
+        sections.push(`Terminology: ${terminology.join(', ')}`);
+    const risks = asStringList(context.risks);
+    if (risks.length)
+        sections.push(`Known risks:\n${risks.map((r) => `- ${r}`).join('\n')}`);
+    const openQuestions = asStringList(context.openQuestions);
+    if (openQuestions.length)
+        sections.push(`Open questions:\n${openQuestions.map((q) => `- ${q}`).join('\n')}`);
+    const suggestedLabels = asStringList(context.suggestedLabels);
+    if (suggestedLabels.length)
+        sections.push(`Suggested labels: ${suggestedLabels.join(', ')}`);
+    return sections.join('\n\n');
+}
+// Ensure the user has at least one PROJECT (board) thread, returning the most
+// recent. Issue-scoped threads (issueId set) are excluded so board chat and
+// issue chat never mix.
 async function getOrCreateActiveThread(projectId, userId) {
     const existing = await prisma.chatThread.findFirst({
-        where: { projectId, userId },
+        where: { projectId, userId, issueId: null },
         orderBy: { updatedAt: 'desc' },
     });
     if (existing)
         return existing;
     return prisma.chatThread.create({ data: { projectId, userId } });
+}
+// Ensure the user has at least one thread for THIS issue, returning the most recent.
+async function getOrCreateActiveIssueThread(projectId, issueId, userId) {
+    const existing = await prisma.chatThread.findFirst({
+        where: { projectId, issueId, userId },
+        orderBy: { updatedAt: 'desc' },
+    });
+    if (existing)
+        return existing;
+    return prisma.chatThread.create({ data: { projectId, issueId, userId } });
+}
+// Load an issue and verify it belongs to the caller's active workspace.
+async function loadOwnedIssue(issueId, req) {
+    const issue = await prisma.issue.findFirst({
+        where: { id: issueId, project: { workspaceId: req.workspaceId } },
+        select: { id: true, projectId: true },
+    });
+    if (!issue)
+        throw new HttpError(404, 'Issue not found');
+    return issue;
 }
 // Load a thread and verify it belongs to the caller and the active workspace.
 async function loadOwnedThread(threadId, req) {
@@ -45,7 +96,7 @@ chatRouter.get('/projects/:projectId/chat/threads', asyncHandler(async (req, res
         throw new HttpError(404, 'Project not found');
     await getOrCreateActiveThread(project.id, req.user.id);
     const threads = await prisma.chatThread.findMany({
-        where: { projectId: project.id, userId: req.user.id },
+        where: { projectId: project.id, userId: req.user.id, issueId: null },
         orderBy: { updatedAt: 'desc' },
         select: {
             id: true,
@@ -73,6 +124,39 @@ chatRouter.post('/projects/:projectId/chat/threads', asyncHandler(async (req, re
         throw new HttpError(404, 'Project not found');
     const thread = await prisma.chatThread.create({
         data: { projectId: project.id, userId: req.user.id },
+    });
+    res.status(201).json({
+        thread: { id: thread.id, title: thread.title, updatedAt: thread.updatedAt, messageCount: 0 },
+    });
+}));
+// List the user's conversations for a specific issue (ensures at least one exists).
+chatRouter.get('/issues/:issueId/chat/threads', asyncHandler(async (req, res) => {
+    const issue = await loadOwnedIssue(req.params.issueId, req);
+    await getOrCreateActiveIssueThread(issue.projectId, issue.id, req.user.id);
+    const threads = await prisma.chatThread.findMany({
+        where: { issueId: issue.id, userId: req.user.id },
+        orderBy: { updatedAt: 'desc' },
+        select: {
+            id: true,
+            title: true,
+            updatedAt: true,
+            _count: { select: { messages: true } },
+        },
+    });
+    res.json({
+        threads: threads.map((t) => ({
+            id: t.id,
+            title: t.title,
+            updatedAt: t.updatedAt,
+            messageCount: t._count.messages,
+        })),
+    });
+}));
+// Start a fresh conversation scoped to an issue.
+chatRouter.post('/issues/:issueId/chat/threads', asyncHandler(async (req, res) => {
+    const issue = await loadOwnedIssue(req.params.issueId, req);
+    const thread = await prisma.chatThread.create({
+        data: { projectId: issue.projectId, issueId: issue.id, userId: req.user.id },
     });
     res.status(201).json({
         thread: { id: thread.id, title: thread.title, updatedAt: thread.updatedAt, messageCount: 0 },
@@ -118,8 +202,38 @@ chatRouter.post('/chat/threads/:threadId/messages', asyncHandler(async (req, res
         : [];
     const fileSummaries = files.map((f) => `${f.fileName} (${f.contentType})`);
     const contextText = project.context
-        ? `${project.context.summary}\nComponents: ${project.context.components.join(', ')}`
+        ? formatProjectContext(project.context)
         : project.description;
+    // Issue-scoped thread: run the single-issue agent (answer + optional
+    // confirm-gated action). It never drafts a new issue card.
+    if (thread.issueId) {
+        // Re-verify the issue still exists in this workspace (404 rather than
+        // answering with an empty/hallucinated context if it vanished).
+        await loadOwnedIssue(thread.issueId, req);
+        const issueIntel = await buildIssueIntel(thread.issueId);
+        const issueAgent = await generateIssueAgentReply({
+            history,
+            userMessage: content,
+            projectContext: contextText,
+            issueIntel,
+        });
+        await prisma.chatMessage.create({
+            data: { threadId: thread.id, role: 'assistant', content: issueAgent.reply },
+        });
+        const issueTitle = thread.title ?? deriveThreadTitle(content);
+        await prisma.chatThread.update({
+            where: { id: thread.id },
+            data: { title: issueTitle, updatedAt: new Date() },
+        });
+        res.status(201).json({
+            threadId: thread.id,
+            message: issueAgent.reply,
+            suggestion: null,
+            action: issueAgent.action,
+            title: issueTitle,
+        });
+        return;
+    }
     const projectIntel = await buildProjectIntel(project.id);
     const agent = await generateAgentReply({
         history,
@@ -156,6 +270,7 @@ chatRouter.post('/chat/threads/:threadId/messages', asyncHandler(async (req, res
         threadId: thread.id,
         message: agent.reply,
         suggestion: suggestionPayload,
+        action: null,
         title,
     });
 }));

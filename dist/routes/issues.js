@@ -109,6 +109,64 @@ issuesRouter.post('/projects/:projectId/issues', asyncHandler(async (req, res) =
     }
     res.status(201).json({ issue });
 }));
+// Search issues across every project in the workspace. Matches on title,
+// issue key, and keyword aliases for severity / status / type.
+const SEVERITY_VALUES = ['low', 'medium', 'high', 'critical'];
+const ISSUE_TYPE_VALUES = [
+    'bug',
+    'feature',
+    'improvement',
+    'task',
+    'regression',
+    'investigation',
+    'design',
+    'documentation',
+    'support',
+    'question',
+];
+function matchStatus(q) {
+    if (q === 'open')
+        return 'open';
+    if (['in_progress', 'in progress', 'progress', 'inprogress'].includes(q))
+        return 'in_progress';
+    if (['resolved', 'done', 'closed', 'complete', 'completed'].includes(q))
+        return 'resolved';
+    return null;
+}
+issuesRouter.get('/search/issues', asyncHandler(async (req, res) => {
+    const workspaceId = req.workspaceId;
+    if (!workspaceId)
+        throw new HttpError(400, 'No workspace');
+    const q = String(req.query.q ?? '').trim();
+    if (!q) {
+        res.json({ issues: [] });
+        return;
+    }
+    const lower = q.toLowerCase();
+    const or = [
+        { title: { contains: q, mode: 'insensitive' } },
+        { issueKey: { contains: q, mode: 'insensitive' } },
+    ];
+    if (SEVERITY_VALUES.includes(lower)) {
+        or.push({ severity: lower });
+    }
+    const status = matchStatus(lower);
+    if (status)
+        or.push({ status });
+    if (ISSUE_TYPE_VALUES.includes(lower)) {
+        or.push({ type: lower });
+    }
+    const issues = await prisma.issue.findMany({
+        where: { project: { workspaceId }, OR: or },
+        orderBy: { createdAt: 'desc' },
+        take: 40,
+        select: {
+            ...boardIssueSelect,
+            project: { select: { id: true, key: true, name: true, color: true } },
+        },
+    });
+    res.json({ issues: issues.map(serializeIssue) });
+}));
 issuesRouter.get('/issues/:issueId', asyncHandler(async (req, res) => {
     const workspaceId = req.workspaceId;
     if (!workspaceId)
@@ -134,14 +192,39 @@ issuesRouter.get('/issues/:issueId', asyncHandler(async (req, res) => {
 const patchSchema = z.object({
     title: z.string().min(1).optional(),
     description: z.string().optional(),
-    type: z.string().optional(),
+    type: z
+        .enum([
+        'bug',
+        'feature',
+        'improvement',
+        'task',
+        'regression',
+        'investigation',
+        'design',
+        'documentation',
+        'support',
+        'question',
+    ])
+        .optional(),
     status: z.enum(['open', 'in_progress', 'resolved']).optional(),
-    severity: z.string().nullish(),
-    priority: z.string().nullish(),
+    severity: z.enum(['low', 'medium', 'high', 'critical']).nullish(),
+    priority: z.enum(['low', 'medium', 'high', 'urgent']).nullish(),
     assigneeId: z.string().uuid().nullish(),
+    environment: z.string().nullish(),
+    expectedResult: z.string().nullish(),
+    actualResult: z.string().nullish(),
+    stepsToReproduce: z.array(z.string()).optional(),
+    acceptanceCriteria: z.array(z.string()).optional(),
 });
 issuesRouter.patch('/issues/:issueId', asyncHandler(async (req, res) => {
     const body = patchSchema.parse(req.body);
+    // Scope the write to the caller's workspace (prevents cross-workspace IDOR).
+    const owned = await prisma.issue.findFirst({
+        where: { id: req.params.issueId, project: { workspaceId: req.workspaceId } },
+        select: { id: true },
+    });
+    if (!owned)
+        throw new HttpError(404, 'Issue not found');
     const issue = await prisma.issue.update({
         where: { id: req.params.issueId },
         data: body,
@@ -197,7 +280,9 @@ const commentSchema = z.object({
     fileIds: z.array(z.string().uuid()).default([]),
 });
 issuesRouter.post('/issues/:issueId/comments', asyncHandler(async (req, res) => {
-    const issue = await prisma.issue.findUnique({ where: { id: req.params.issueId } });
+    const issue = await prisma.issue.findFirst({
+        where: { id: req.params.issueId, project: { workspaceId: req.workspaceId } },
+    });
     if (!issue)
         throw new HttpError(404, 'Issue not found');
     const { body, reviewState, fileIds } = commentSchema.parse(req.body);

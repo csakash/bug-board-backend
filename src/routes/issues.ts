@@ -231,17 +231,41 @@ issuesRouter.get(
 const patchSchema = z.object({
   title: z.string().min(1).optional(),
   description: z.string().optional(),
-  type: z.string().optional(),
+  type: z
+    .enum([
+      'bug',
+      'feature',
+      'improvement',
+      'task',
+      'regression',
+      'investigation',
+      'design',
+      'documentation',
+      'support',
+      'question',
+    ])
+    .optional(),
   status: z.enum(['open', 'in_progress', 'resolved']).optional(),
-  severity: z.string().nullish(),
-  priority: z.string().nullish(),
+  severity: z.enum(['low', 'medium', 'high', 'critical']).nullish(),
+  priority: z.enum(['low', 'medium', 'high', 'urgent']).nullish(),
   assigneeId: z.string().uuid().nullish(),
+  environment: z.string().nullish(),
+  expectedResult: z.string().nullish(),
+  actualResult: z.string().nullish(),
+  stepsToReproduce: z.array(z.string()).optional(),
+  acceptanceCriteria: z.array(z.string()).optional(),
 });
 
 issuesRouter.patch(
   '/issues/:issueId',
   asyncHandler(async (req: AuthedRequest, res) => {
     const body = patchSchema.parse(req.body);
+    // Scope the write to the caller's workspace (prevents cross-workspace IDOR).
+    const owned = await prisma.issue.findFirst({
+      where: { id: req.params.issueId, project: { workspaceId: req.workspaceId } },
+      select: { id: true },
+    });
+    if (!owned) throw new HttpError(404, 'Issue not found');
     const issue = await prisma.issue.update({
       where: { id: req.params.issueId },
       data: body as never,
@@ -307,7 +331,9 @@ const commentSchema = z.object({
 issuesRouter.post(
   '/issues/:issueId/comments',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const issue = await prisma.issue.findUnique({ where: { id: req.params.issueId } });
+    const issue = await prisma.issue.findFirst({
+      where: { id: req.params.issueId, project: { workspaceId: req.workspaceId } },
+    });
     if (!issue) throw new HttpError(404, 'Issue not found');
     const { body, reviewState, fileIds } = commentSchema.parse(req.body);
 

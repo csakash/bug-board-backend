@@ -5,6 +5,8 @@ import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
 import { invalidateCache, remember } from '../services/response-cache.js';
 import { generateProjectContext } from '../services/gemini.js';
+import { getObjectBytes } from '../files/r2.js';
+import { isR2Configured } from '../config/env.js';
 export const projectsRouter = Router();
 const createSchema = z.object({
     name: z.string().min(1).max(120),
@@ -43,11 +45,34 @@ async function runContextGeneration(projectId) {
         if (!project)
             return;
         const fileSummaries = project.files.map((pf) => `${pf.file.fileName} (${pf.file.contentType}, ${pf.purpose})`);
+        // Pull a handful of screenshots so the model can "see" the product and build
+        // richer context. Bounded by count and size to stay within request limits.
+        const MAX_IMAGES = 6;
+        const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+        const images = [];
+        if (isR2Configured) {
+            const imageFiles = project.files
+                .filter((pf) => pf.file.contentType.startsWith('image/') &&
+                (pf.purpose === 'screenshot' || pf.purpose === 'context'))
+                .slice(0, MAX_IMAGES);
+            for (const pf of imageFiles) {
+                try {
+                    const bytes = await getObjectBytes(pf.file.objectKey);
+                    if (bytes.length > MAX_IMAGE_BYTES)
+                        continue;
+                    images.push({ data: bytes.toString('base64'), mimeType: pf.file.contentType });
+                }
+                catch (err) {
+                    console.error('Failed to load screenshot for context generation:', pf.file.id, err);
+                }
+            }
+        }
         const result = await generateProjectContext({
             name: project.name,
             description: project.description,
             fileSummaries,
             links: [],
+            images,
         });
         await prisma.projectContext.upsert({
             where: { projectId },
@@ -227,6 +252,25 @@ projectsRouter.patch('/:projectId', asyncHandler(async (req, res) => {
         invalidateCache(`workspace:${req.workspaceId}:projects`);
         invalidateCache(`workspace:${req.workspaceId}:project:${req.params.projectId}`);
     }
+    res.json({ ok: true });
+}));
+projectsRouter.delete('/:projectId', asyncHandler(async (req, res) => {
+    const workspaceId = req.workspaceId;
+    if (!workspaceId)
+        throw new HttpError(400, 'No workspace');
+    const project = await prisma.project.findFirst({
+        where: { id: req.params.projectId, workspaceId },
+        select: { id: true },
+    });
+    if (!project)
+        throw new HttpError(404, 'Project not found');
+    // Related rows (issues, labels, files, threads, context, suggestions,
+    // relations, activity) cascade via the schema's onDelete: Cascade.
+    await prisma.project.delete({ where: { id: project.id } });
+    invalidateCache(`workspace:${workspaceId}:projects`);
+    invalidateCache(`workspace:${workspaceId}:project:${project.id}`);
+    invalidateCache(`workspace:${workspaceId}:project:${project.id}:issues`);
+    invalidateCache(`project:${project.id}:context`);
     res.json({ ok: true });
 }));
 projectsRouter.get('/:projectId/context', asyncHandler(async (req, res) => {
