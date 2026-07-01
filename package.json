@@ -1,6 +1,6 @@
 {
   "name": "bugbot-backend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",
     "db:seed": "tsx prisma/seed.ts",
+    "db:backfill-members": "tsx prisma/backfill-project-members.ts",
     "db:studio": "prisma studio"
   },
   "prisma": {
@@ -28,6 +29,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "jsonwebtoken": "^9.0.2",
+    "resend": "^4.8.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

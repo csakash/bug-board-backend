@@ -4,6 +4,9 @@ import { prisma } from '../db/client.js';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
 import { invalidateCache, remember } from '../services/response-cache.js';
+import { invalidateProjectCaches } from '../services/project-cache.js';
+import { requireProjectAccess } from '../lib/access.js';
+import { buildAcceptUrl, inviteToProject } from '../services/invites.js';
 import { generateProjectContext } from '../services/gemini.js';
 import { getObjectBytes } from '../files/r2.js';
 import { isR2Configured } from '../config/env.js';
@@ -23,6 +26,8 @@ const createSchema = z.object({
   links: z.array(z.string()).default([]),
   fileIds: z.array(z.string().uuid()).default([]),
   screenshotIds: z.array(z.string().uuid()).default([]),
+  // Optional teammate emails to invite at creation time.
+  invites: z.array(z.string().email()).max(20).default([]),
 });
 
 const updateSchema = z.object({
@@ -30,6 +35,8 @@ const updateSchema = z.object({
   description: z.string().min(1).optional(),
   color: z.string().optional(),
 });
+
+const inviteSchema = z.object({ email: z.string().email() });
 
 function deriveKey(name: string): string {
   const letters = name.replace(/[^A-Za-z]/g, '').toUpperCase();
@@ -127,31 +134,29 @@ async function runContextGeneration(projectId: string): Promise<void> {
       data: { contextStatus: 'ready' },
     });
 
-    invalidateCache(`workspace:${project.workspaceId}:projects`);
-    invalidateCache(`workspace:${project.workspaceId}:project:${project.id}`);
+    await invalidateProjectCaches(projectId);
   } catch (err) {
     console.error('Context generation failed:', err);
     const failedProject = await prisma.project
       .update({ where: { id: projectId }, data: { contextStatus: 'failed' } })
       .catch(() => undefined);
     if (failedProject) {
-      invalidateCache(`workspace:${failedProject.workspaceId}:projects`);
-      invalidateCache(`workspace:${failedProject.workspaceId}:project:${failedProject.id}`);
+      await invalidateProjectCaches(failedProject.id);
     }
   }
 }
 
 projectsRouter.use(requireAuth);
 
+// List projects the caller is a member of (owner or member).
 projectsRouter.get(
   '/',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const workspaceId = req.workspaceId;
-    if (!workspaceId) throw new HttpError(400, 'No workspace');
+    const userId = req.user!.id;
 
-    const data = await remember(`workspace:${workspaceId}:projects`, 10_000, async () => {
+    const data = await remember(`user:${userId}:projects`, 5_000, async () => {
       const projects = await prisma.project.findMany({
-        where: { workspaceId },
+        where: { members: { some: { userId } } },
         orderBy: { createdAt: 'asc' },
         select: {
           id: true,
@@ -161,14 +166,14 @@ projectsRouter.get(
           color: true,
           contextStatus: true,
           context: { select: { summary: true } },
-          _count: { select: { issues: true } },
+          _count: { select: { issues: true, members: true } },
         },
       });
 
       const activeCounts = await prisma.issue.groupBy({
         by: ['projectId'],
         where: {
-          project: { workspaceId },
+          project: { members: { some: { userId } } },
           status: { not: 'resolved' },
         },
         _count: { _all: true },
@@ -188,6 +193,8 @@ projectsRouter.get(
         contextStatus: p.contextStatus,
         issueCount: p._count.issues,
         activeCount: activeCountByProjectId.get(p.id) ?? 0,
+        // A project is "shared" once it has more than just its owner.
+        memberCount: p._count.members,
       }));
     });
 
@@ -201,6 +208,7 @@ projectsRouter.post(
     const workspaceId = req.workspaceId;
     if (!workspaceId) throw new HttpError(400, 'No workspace');
     const body = createSchema.parse(req.body);
+    const userId = req.user!.id;
 
     let key = (body.key ?? deriveKey(body.name)).toUpperCase();
     // Ensure key uniqueness within the workspace.
@@ -218,6 +226,7 @@ projectsRouter.post(
       key = `${base}${suffix++}`;
     }
 
+    // Create the project and its owner membership together.
     const project = await prisma.project.create({
       data: {
         workspaceId,
@@ -225,7 +234,8 @@ projectsRouter.post(
         key,
         description: body.description,
         color: body.color,
-        createdById: req.user!.id,
+        createdById: userId,
+        members: { create: { userId, role: 'owner' } },
         files: {
           create: [
             ...body.fileIds.map((fileId) => ({ fileId, purpose: 'context' as const })),
@@ -238,30 +248,52 @@ projectsRouter.post(
       },
     });
 
-    invalidateCache(`workspace:${workspaceId}:projects`);
+    // Send any invites requested at creation. Deduped + never throws.
+    const inviteResults = [];
+    const seen = new Set<string>();
+    for (const rawEmail of body.invites) {
+      const email = rawEmail.trim().toLowerCase();
+      if (!email || seen.has(email)) continue;
+      seen.add(email);
+      const outcome = await inviteToProject({
+        projectId: project.id,
+        email,
+        invitedById: userId,
+        inviterName: req.user!.name,
+        projectName: project.name,
+      });
+      inviteResults.push({ email, ...outcome });
+    }
+
+    await invalidateProjectCaches(project.id);
 
     // Kick off AI context generation without blocking the response.
     void runContextGeneration(project.id);
 
-    res.status(201).json({ project });
+    res.status(201).json({ project, invites: inviteResults });
   }),
 );
 
 projectsRouter.get(
   '/:projectId',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const workspaceId = req.workspaceId;
-    if (!workspaceId) throw new HttpError(400, 'No workspace');
+    const member = await requireProjectAccess(req.params.projectId, req.user!.id);
 
     const project = await remember(
-      `workspace:${workspaceId}:project:${req.params.projectId}`,
-      10_000,
+      `project:${req.params.projectId}:detail`,
+      3_000,
       async () =>
-        prisma.project.findFirst({
-          where: { id: req.params.projectId, workspaceId },
+        prisma.project.findUnique({
+          where: { id: req.params.projectId },
           include: {
             context: true,
             labels: true,
+            members: {
+              orderBy: { createdAt: 'asc' },
+              include: {
+                user: { select: { id: true, name: true, email: true, avatarUrl: true } },
+              },
+            },
             files: {
               orderBy: { createdAt: 'asc' },
               include: {
@@ -280,24 +312,53 @@ projectsRouter.get(
         }),
     );
     if (!project) throw new HttpError(404, 'Project not found');
-    res.json({ project });
+
+    // Only owners see pending invites (not cached — cheap and owner-only).
+    const pendingInvites =
+      member.role === 'owner'
+        ? (
+            await prisma.projectInvite.findMany({
+              where: {
+                projectId: project.id,
+                status: 'pending',
+                expiresAt: { gt: new Date() },
+              },
+              orderBy: { createdAt: 'desc' },
+              select: { id: true, email: true, createdAt: true, expiresAt: true, token: true },
+            })
+          ).map(({ token, ...inv }) => ({ ...inv, acceptUrl: buildAcceptUrl(token) }))
+        : [];
+
+    const members = project.members.map((m) => ({
+      userId: m.userId,
+      role: m.role,
+      name: m.user.name,
+      email: m.user.email,
+      avatarUrl: m.user.avatarUrl,
+      joinedAt: m.createdAt,
+    }));
+
+    res.json({
+      project: {
+        ...project,
+        members,
+        myRole: member.role,
+        pendingInvites,
+      },
+    });
   }),
 );
 
 projectsRouter.patch(
   '/:projectId',
   asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
     const body = updateSchema.parse(req.body);
-    const project = await prisma.project.updateMany({
-      where: { id: req.params.projectId, workspaceId: req.workspaceId },
+    await prisma.project.update({
+      where: { id: req.params.projectId },
       data: body,
     });
-    if (!project) throw new HttpError(404, 'Project not found');
-    if (project.count === 0) throw new HttpError(404, 'Project not found');
-    if (req.workspaceId) {
-      invalidateCache(`workspace:${req.workspaceId}:projects`);
-      invalidateCache(`workspace:${req.workspaceId}:project:${req.params.projectId}`);
-    }
+    await invalidateProjectCaches(req.params.projectId);
     res.json({ ok: true });
   }),
 );
@@ -305,23 +366,14 @@ projectsRouter.patch(
 projectsRouter.delete(
   '/:projectId',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const workspaceId = req.workspaceId;
-    if (!workspaceId) throw new HttpError(400, 'No workspace');
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
 
-    const project = await prisma.project.findFirst({
-      where: { id: req.params.projectId, workspaceId },
-      select: { id: true },
-    });
-    if (!project) throw new HttpError(404, 'Project not found');
+    // Snapshot member ids before delete so we can clear their list caches.
+    await invalidateProjectCaches(req.params.projectId);
 
     // Related rows (issues, labels, files, threads, context, suggestions,
-    // relations, activity) cascade via the schema's onDelete: Cascade.
-    await prisma.project.delete({ where: { id: project.id } });
-
-    invalidateCache(`workspace:${workspaceId}:projects`);
-    invalidateCache(`workspace:${workspaceId}:project:${project.id}`);
-    invalidateCache(`workspace:${workspaceId}:project:${project.id}:issues`);
-    invalidateCache(`project:${project.id}:context`);
+    // relations, activity, members, invites) cascade via onDelete: Cascade.
+    await prisma.project.delete({ where: { id: req.params.projectId } });
 
     res.json({ ok: true });
   }),
@@ -330,6 +382,7 @@ projectsRouter.delete(
 projectsRouter.get(
   '/:projectId/context',
   asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id);
     const context = await remember(
       `project:${req.params.projectId}:context`,
       10_000,
@@ -345,16 +398,132 @@ projectsRouter.get(
 projectsRouter.post(
   '/:projectId/context/regenerate',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const project = await prisma.project.findFirst({
-      where: { id: req.params.projectId, workspaceId: req.workspaceId },
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
+    await invalidateProjectCaches(req.params.projectId);
+    void runContextGeneration(req.params.projectId);
+    res.json({ ok: true, contextStatus: 'generating' });
+  }),
+);
+
+// ---------- Invites (owner-only) ----------
+
+projectsRouter.get(
+  '/:projectId/invites',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
+    const rows = await prisma.projectInvite.findMany({
+      where: {
+        projectId: req.params.projectId,
+        status: 'pending',
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, email: true, createdAt: true, expiresAt: true, token: true },
+    });
+    const invites = rows.map(({ token, ...inv }) => ({ ...inv, acceptUrl: buildAcceptUrl(token) }));
+    res.json({ invites });
+  }),
+);
+
+projectsRouter.post(
+  '/:projectId/invites',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
+    const { email } = inviteSchema.parse(req.body);
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.projectId },
+      select: { name: true },
     });
     if (!project) throw new HttpError(404, 'Project not found');
-    if (req.workspaceId) {
-      invalidateCache(`workspace:${req.workspaceId}:projects`);
-      invalidateCache(`workspace:${req.workspaceId}:project:${project.id}`);
+
+    const outcome = await inviteToProject({
+      projectId: req.params.projectId,
+      email,
+      invitedById: req.user!.id,
+      inviterName: req.user!.name,
+      projectName: project.name,
+    });
+
+    if (outcome.alreadyMember) {
+      res.json({ alreadyMember: true });
+      return;
     }
-    invalidateCache(`project:${project.id}:context`);
-    void runContextGeneration(project.id);
-    res.json({ ok: true, contextStatus: 'generating' });
+    res.status(201).json({
+      invite: outcome.invite,
+      emailSent: outcome.emailSent,
+      acceptUrl: outcome.invite ? buildAcceptUrl(outcome.invite.token) : undefined,
+    });
+  }),
+);
+
+projectsRouter.delete(
+  '/:projectId/invites/:inviteId',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
+    const invite = await prisma.projectInvite.findFirst({
+      where: { id: req.params.inviteId, projectId: req.params.projectId },
+    });
+    if (!invite) throw new HttpError(404, 'Invite not found');
+    if (invite.status === 'pending') {
+      await prisma.projectInvite.update({
+        where: { id: invite.id },
+        data: { status: 'revoked' },
+      });
+    }
+    res.json({ ok: true });
+  }),
+);
+
+// ---------- Members ----------
+
+projectsRouter.get(
+  '/:projectId/members',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id);
+    const members = await prisma.projectMember.findMany({
+      where: { projectId: req.params.projectId },
+      orderBy: { createdAt: 'asc' },
+      include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
+    });
+    res.json({
+      members: members.map((m) => ({
+        userId: m.userId,
+        role: m.role,
+        name: m.user.name,
+        email: m.user.email,
+        avatarUrl: m.user.avatarUrl,
+        joinedAt: m.createdAt,
+      })),
+    });
+  }),
+);
+
+projectsRouter.delete(
+  '/:projectId/members/:userId',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    await requireProjectAccess(req.params.projectId, req.user!.id, 'owner');
+    const target = await prisma.projectMember.findUnique({
+      where: {
+        projectId_userId: { projectId: req.params.projectId, userId: req.params.userId },
+      },
+    });
+    if (!target) throw new HttpError(404, 'Member not found');
+
+    // Guard the last owner: a project must always keep at least one owner.
+    if (target.role === 'owner') {
+      const ownerCount = await prisma.projectMember.count({
+        where: { projectId: req.params.projectId, role: 'owner' },
+      });
+      if (ownerCount <= 1) {
+        throw new HttpError(400, 'Cannot remove the last owner of a project');
+      }
+    }
+
+    await prisma.projectMember.delete({ where: { id: target.id } });
+    await invalidateProjectCaches(req.params.projectId);
+    // The removed user is no longer a member, so the cache sweep above won't
+    // touch their list cache — clear it explicitly so they lose access promptly.
+    invalidateCache(`user:${req.params.userId}:projects`);
+    res.json({ ok: true });
   }),
 );

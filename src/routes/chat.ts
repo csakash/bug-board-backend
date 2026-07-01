@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../db/client.js';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
+import { requireProjectAccess } from '../lib/access.js';
 import { generateAgentReply, type AgentTurn } from '../services/gemini.js';
 import { buildProjectIntel } from '../services/project-intel.js';
 import { createIssue } from '../services/issues.js';
@@ -66,36 +67,35 @@ async function getOrCreateActiveThread(projectId: string, userId: string) {
   return prisma.chatThread.create({ data: { projectId, userId } });
 }
 
-// Load a thread and verify it belongs to the caller and the active workspace.
+// Load a thread and verify it belongs to the caller, who must still be a member
+// of the thread's project. Chat threads are per-user, so we also gate on userId.
 async function loadOwnedThread(threadId: string, req: AuthedRequest) {
-  const thread = await prisma.chatThread.findUnique({
-    where: { id: threadId },
-    include: { project: { select: { workspaceId: true } } },
-  });
-  if (
-    !thread ||
-    thread.userId !== req.user!.id ||
-    thread.project.workspaceId !== req.workspaceId
-  ) {
+  const thread = await prisma.chatThread.findUnique({ where: { id: threadId } });
+  if (!thread || thread.userId !== req.user!.id) {
     throw new HttpError(404, 'Conversation not found');
   }
+  await requireProjectAccess(thread.projectId, req.user!.id);
   return thread;
+}
+
+// Load a suggestion and verify the caller is a member of its project.
+async function loadOwnedSuggestion(suggestionId: string, req: AuthedRequest) {
+  const suggestion = await prisma.issueSuggestion.findUnique({ where: { id: suggestionId } });
+  if (!suggestion) throw new HttpError(404, 'Suggestion not found');
+  await requireProjectAccess(suggestion.projectId, req.user!.id);
+  return suggestion;
 }
 
 // List the user's conversations for a project (ensures at least one exists).
 chatRouter.get(
   '/projects/:projectId/chat/threads',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const project = await prisma.project.findFirst({
-      where: { id: req.params.projectId, workspaceId: req.workspaceId },
-      select: { id: true },
-    });
-    if (!project) throw new HttpError(404, 'Project not found');
+    await requireProjectAccess(req.params.projectId, req.user!.id);
 
-    await getOrCreateActiveThread(project.id, req.user!.id);
+    await getOrCreateActiveThread(req.params.projectId, req.user!.id);
 
     const threads = await prisma.chatThread.findMany({
-      where: { projectId: project.id, userId: req.user!.id },
+      where: { projectId: req.params.projectId, userId: req.user!.id },
       orderBy: { updatedAt: 'desc' },
       select: {
         id: true,
@@ -120,14 +120,10 @@ chatRouter.get(
 chatRouter.post(
   '/projects/:projectId/chat/threads',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const project = await prisma.project.findFirst({
-      where: { id: req.params.projectId, workspaceId: req.workspaceId },
-      select: { id: true },
-    });
-    if (!project) throw new HttpError(404, 'Project not found');
+    await requireProjectAccess(req.params.projectId, req.user!.id);
 
     const thread = await prisma.chatThread.create({
-      data: { projectId: project.id, userId: req.user!.id },
+      data: { projectId: req.params.projectId, userId: req.user!.id },
     });
     res.status(201).json({
       thread: { id: thread.id, title: thread.title, updatedAt: thread.updatedAt, messageCount: 0 },
@@ -159,8 +155,8 @@ chatRouter.post(
   '/chat/threads/:threadId/messages',
   asyncHandler(async (req: AuthedRequest, res) => {
     const thread = await loadOwnedThread(req.params.threadId, req);
-    const project = await prisma.project.findFirst({
-      where: { id: thread.projectId, workspaceId: req.workspaceId },
+    const project = await prisma.project.findUnique({
+      where: { id: thread.projectId },
       include: { context: true, labels: true },
     });
     if (!project) throw new HttpError(404, 'Project not found');
@@ -240,10 +236,7 @@ chatRouter.post(
 chatRouter.get(
   '/issue-suggestions/:suggestionId',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const suggestion = await prisma.issueSuggestion.findUnique({
-      where: { id: req.params.suggestionId },
-    });
-    if (!suggestion) throw new HttpError(404, 'Suggestion not found');
+    const suggestion = await loadOwnedSuggestion(req.params.suggestionId, req);
     res.json({ suggestion });
   }),
 );
@@ -254,6 +247,7 @@ const patchDraftSchema = z.object({ draft: z.record(z.any()) });
 chatRouter.patch(
   '/issue-suggestions/:suggestionId',
   asyncHandler(async (req: AuthedRequest, res) => {
+    await loadOwnedSuggestion(req.params.suggestionId, req);
     const { draft } = patchDraftSchema.parse(req.body);
     const suggestion = await prisma.issueSuggestion.update({
       where: { id: req.params.suggestionId },
@@ -266,6 +260,7 @@ chatRouter.patch(
 chatRouter.post(
   '/issue-suggestions/:suggestionId/dismiss',
   asyncHandler(async (req: AuthedRequest, res) => {
+    await loadOwnedSuggestion(req.params.suggestionId, req);
     await prisma.issueSuggestion.update({
       where: { id: req.params.suggestionId },
       data: { status: 'dismissed' },
@@ -278,10 +273,7 @@ chatRouter.post(
 chatRouter.post(
   '/issue-suggestions/:suggestionId/add-to-board',
   asyncHandler(async (req: AuthedRequest, res) => {
-    const suggestion = await prisma.issueSuggestion.findUnique({
-      where: { id: req.params.suggestionId },
-    });
-    if (!suggestion) throw new HttpError(404, 'Suggestion not found');
+    const suggestion = await loadOwnedSuggestion(req.params.suggestionId, req);
     if (suggestion.status === 'accepted') {
       throw new HttpError(409, 'Suggestion already added to board');
     }

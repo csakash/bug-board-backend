@@ -1,1 +1,7 @@
 node_modules/
+.gstack/
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local

@@ -40,6 +40,7 @@ export async function generateProjectContext(input) {
     };
     if (!genAI)
         return fallback;
+    const images = input.images ?? [];
     const model = genAI.getGenerativeModel({ model: env.gemini.model });
     const prompt = `You are an assistant that builds a reusable project context profile for an issue tracker.
 The tracker handles ALL product work: bugs, features, improvements, tasks, regressions, investigations, design, documentation, support, and questions.
@@ -50,6 +51,9 @@ Attached resources:
 ${input.fileSummaries.map((s) => `- ${s}`).join('\n') || '- none'}
 Links:
 ${input.links.map((l) => `- ${l}`).join('\n') || '- none'}
+${images.length
+        ? `\n${images.length} product screenshot(s) are attached below. Carefully study them to infer the UI, key flows, components, audience, and terminology, and reflect what you see in your answer.`
+        : ''}
 
 Return ONLY a JSON object with this exact shape:
 {
@@ -64,7 +68,10 @@ Return ONLY a JSON object with this exact shape:
   "openQuestions": string[]
 }`;
     try {
-        const result = await model.generateContent(prompt);
+        const imageParts = images.map((img) => ({
+            inlineData: { data: img.data, mimeType: img.mimeType },
+        }));
+        const result = await model.generateContent(imageParts.length ? [prompt, ...imageParts] : prompt);
         const parsed = extractJson(result.response.text());
         return { ...fallback, ...parsed };
     }

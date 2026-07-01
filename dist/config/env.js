@@ -22,6 +22,10 @@ export const env = {
         .filter(Boolean),
     jwtSecret: required('JWT_SECRET'),
     databaseUrl: required('DATABASE_URL'),
+    // Canonical public origin used to build links that leave the server (invite
+    // emails). Must be the address a recipient can actually reach — set this in
+    // every deployed environment. Empty in dev falls back to a frontend URL.
+    appUrl: optional('APP_URL'),
     r2: {
         accountId: optional('R2_ACCOUNT_ID'),
         accessKeyId: optional('R2_ACCESS_KEY_ID'),
@@ -33,7 +37,15 @@ export const env = {
         apiKey: optional('GEMINI_API_KEY'),
         model: optional('GEMINI_MODEL', 'gemini-1.5-flash'),
     },
+    email: {
+        apiKey: optional('RESEND_API_KEY'),
+        // Resend's shared sandbox sender works without domain verification for dev.
+        from: optional('RESEND_FROM', 'Bug Board <onboarding@resend.dev>'),
+    },
 };
 export const isR2Configured = Boolean(env.r2.accountId && env.r2.accessKeyId && env.r2.secretAccessKey);
 export const isGeminiConfigured = Boolean(env.gemini.apiKey);
+// When the Resend key is unset we log invite links to the server console
+// instead of sending mail, so the flow is fully testable before the key exists.
+export const isEmailConfigured = Boolean(env.email.apiKey);
 //# sourceMappingURL=env.js.map
