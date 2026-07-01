@@ -3,9 +3,13 @@ import { z } from 'zod';
 import { prisma } from '../db/client.js';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
-import { requireProjectAccess } from '../lib/access.js';
-import { generateAgentReply, type AgentTurn } from '../services/gemini.js';
-import { buildProjectIntel } from '../services/project-intel.js';
+import { requireIssueAccess, requireProjectAccess } from '../lib/access.js';
+import {
+  generateAgentReply,
+  generateIssueAgentReply,
+  type AgentTurn,
+} from '../services/gemini.js';
+import { buildProjectIntel, buildIssueIntel } from '../services/project-intel.js';
 import { createIssue } from '../services/issues.js';
 
 export const chatRouter = Router();
@@ -57,14 +61,33 @@ function formatProjectContext(context: {
   return sections.join('\n\n');
 }
 
-// Ensure the user has at least one thread for this project, returning the most recent.
+// Ensure the user has at least one PROJECT (board) thread, returning the most
+// recent. Issue-scoped threads (issueId set) are excluded so board chat and
+// issue chat never mix.
 async function getOrCreateActiveThread(projectId: string, userId: string) {
   const existing = await prisma.chatThread.findFirst({
-    where: { projectId, userId },
+    where: { projectId, userId, issueId: null },
     orderBy: { updatedAt: 'desc' },
   });
   if (existing) return existing;
   return prisma.chatThread.create({ data: { projectId, userId } });
+}
+
+// Ensure the user has at least one thread for THIS issue, returning the most recent.
+async function getOrCreateActiveIssueThread(projectId: string, issueId: string, userId: string) {
+  const existing = await prisma.chatThread.findFirst({
+    where: { projectId, issueId, userId },
+    orderBy: { updatedAt: 'desc' },
+  });
+  if (existing) return existing;
+  return prisma.chatThread.create({ data: { projectId, issueId, userId } });
+}
+
+// Load an issue and verify the caller is a member of its project (membership,
+// not workspace — so invited members can use issue-scoped chat too).
+async function loadOwnedIssue(issueId: string, req: AuthedRequest) {
+  const { projectId } = await requireIssueAccess(issueId, req.user!.id);
+  return { id: issueId, projectId };
 }
 
 // Load a thread and verify it belongs to the caller, who must still be a member
@@ -95,7 +118,7 @@ chatRouter.get(
     await getOrCreateActiveThread(req.params.projectId, req.user!.id);
 
     const threads = await prisma.chatThread.findMany({
-      where: { projectId: req.params.projectId, userId: req.user!.id },
+      where: { projectId: req.params.projectId, userId: req.user!.id, issueId: null },
       orderBy: { updatedAt: 'desc' },
       select: {
         id: true,
@@ -124,6 +147,50 @@ chatRouter.post(
 
     const thread = await prisma.chatThread.create({
       data: { projectId: req.params.projectId, userId: req.user!.id },
+    });
+    res.status(201).json({
+      thread: { id: thread.id, title: thread.title, updatedAt: thread.updatedAt, messageCount: 0 },
+    });
+  }),
+);
+
+// List the user's conversations for a specific issue (ensures at least one exists).
+chatRouter.get(
+  '/issues/:issueId/chat/threads',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const issue = await loadOwnedIssue(req.params.issueId, req);
+
+    await getOrCreateActiveIssueThread(issue.projectId, issue.id, req.user!.id);
+
+    const threads = await prisma.chatThread.findMany({
+      where: { issueId: issue.id, userId: req.user!.id },
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        title: true,
+        updatedAt: true,
+        _count: { select: { messages: true } },
+      },
+    });
+
+    res.json({
+      threads: threads.map((t) => ({
+        id: t.id,
+        title: t.title,
+        updatedAt: t.updatedAt,
+        messageCount: t._count.messages,
+      })),
+    });
+  }),
+);
+
+// Start a fresh conversation scoped to an issue.
+chatRouter.post(
+  '/issues/:issueId/chat/threads',
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const issue = await loadOwnedIssue(req.params.issueId, req);
+    const thread = await prisma.chatThread.create({
+      data: { projectId: issue.projectId, issueId: issue.id, userId: req.user!.id },
     });
     res.status(201).json({
       thread: { id: thread.id, title: thread.title, updatedAt: thread.updatedAt, messageCount: 0 },
@@ -185,6 +252,40 @@ chatRouter.post(
       ? formatProjectContext(project.context)
       : project.description;
 
+    // Issue-scoped thread: run the single-issue agent (answer + optional
+    // confirm-gated action). It never drafts a new issue card.
+    if (thread.issueId) {
+      // Re-verify the issue still exists in this workspace (404 rather than
+      // answering with an empty/hallucinated context if it vanished).
+      await loadOwnedIssue(thread.issueId, req);
+      const issueIntel = await buildIssueIntel(thread.issueId);
+      const issueAgent = await generateIssueAgentReply({
+        history,
+        userMessage: content,
+        projectContext: contextText,
+        issueIntel,
+      });
+
+      await prisma.chatMessage.create({
+        data: { threadId: thread.id, role: 'assistant', content: issueAgent.reply },
+      });
+
+      const issueTitle = thread.title ?? deriveThreadTitle(content);
+      await prisma.chatThread.update({
+        where: { id: thread.id },
+        data: { title: issueTitle, updatedAt: new Date() },
+      });
+
+      res.status(201).json({
+        threadId: thread.id,
+        message: issueAgent.reply,
+        suggestion: null,
+        action: issueAgent.action,
+        title: issueTitle,
+      });
+      return;
+    }
+
     const projectIntel = await buildProjectIntel(project.id);
 
     const agent = await generateAgentReply({
@@ -228,6 +329,7 @@ chatRouter.post(
       threadId: thread.id,
       message: agent.reply,
       suggestion: suggestionPayload,
+      action: null,
       title,
     });
   }),

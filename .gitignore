@@ -1,7 +1,8 @@
 node_modules/
 .gstack/
 
-# Secrets — never commit
+# Local env (contains secrets; copied per-worktree by loop-new). Never commit.
 .env
 .env.local
-.env.*.local
+.env.*
+!.env.example

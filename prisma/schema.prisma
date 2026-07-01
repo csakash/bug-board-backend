@@ -394,11 +394,7 @@ model ChatThread {
   id        String   @id @default(uuid())
   projectId String
   userId    String?
-  // issueId is owned by the separate issue-scoped-AI-sidebar loop and already
-  // lives in the shared DB. Declared here (matching the live column/FK/index)
-  // so a `db push` from this branch or from main never drops it. See the
-  // project's shared-Neon-db-push-hazard note.
-  issueId   String?
+  issueId   String?  // set for issue-scoped chat; null for project (board) chat
   title     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
