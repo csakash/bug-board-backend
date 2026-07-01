@@ -5,6 +5,7 @@ import { env } from './config/env.js';
 import { errorHandler, notFound } from './middleware/errors.js';
 import { authRouter } from './routes/auth.js';
 import { chatRouter } from './routes/chat.js';
+import { invitesRouter } from './routes/invites.js';
 import { issuesRouter } from './routes/issues.js';
 import { projectsRouter } from './routes/projects.js';
 import { uploadsRouter } from './routes/uploads.js';
@@ -29,6 +30,7 @@ app.get('/health', (_req, res) => {
 });
 app.use('/api/auth', authRouter);
 app.use('/api/projects', projectsRouter);
+app.use('/api/invites', invitesRouter);
 app.use('/api/uploads', uploadsRouter);
 app.use('/api', issuesRouter);
 app.use('/api', chatRouter);

@@ -3,7 +3,9 @@ import { z } from 'zod';
 import { prisma } from '../db/client.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler, HttpError } from '../middleware/errors.js';
-import { invalidateCache, remember } from '../services/response-cache.js';
+import { remember } from '../services/response-cache.js';
+import { invalidateIssueCaches, invalidateProjectCaches } from '../services/project-cache.js';
+import { requireIssueAccess, requireProjectAccess } from '../lib/access.js';
 import { createIssue } from '../services/issues.js';
 export const issuesRouter = Router();
 issuesRouter.use(requireAuth);
@@ -43,6 +45,21 @@ function serializeIssue(issue) {
     const labels = issue.labels?.map((l) => l.label) ?? [];
     return { ...issue, labels };
 }
+// Keep only file ids the caller may attach: files they uploaded, or files in
+// their own workspace. Blocks laundering a foreign file id onto an issue (which
+// would otherwise grant read access via the membership-scoped download route).
+async function keepAttachableFileIds(fileIds, userId, workspaceId) {
+    if (!fileIds?.length)
+        return [];
+    const or = [{ uploadedById: userId }];
+    if (workspaceId)
+        or.push({ workspaceId });
+    const files = await prisma.file.findMany({
+        where: { id: { in: fileIds }, OR: or },
+        select: { id: true },
+    });
+    return files.map((f) => f.id);
+}
 const createIssueSchema = z.object({
     type: z.string().optional(),
     title: z.string().min(1),
@@ -60,15 +77,10 @@ const createIssueSchema = z.object({
 });
 // List issues for a project, grouped by status.
 issuesRouter.get('/projects/:projectId/issues', asyncHandler(async (req, res) => {
-    const workspaceId = req.workspaceId;
-    if (!workspaceId)
-        throw new HttpError(400, 'No workspace');
-    const payload = await remember(`workspace:${workspaceId}:project:${req.params.projectId}:issues`, 5_000, async () => {
+    await requireProjectAccess(req.params.projectId, req.user.id);
+    const payload = await remember(`project:${req.params.projectId}:issues`, 3_000, async () => {
         const issues = await prisma.issue.findMany({
-            where: {
-                projectId: req.params.projectId,
-                project: { workspaceId },
-            },
+            where: { projectId: req.params.projectId },
             orderBy: { createdAt: 'desc' },
             select: boardIssueSelect,
         });
@@ -91,26 +103,20 @@ issuesRouter.get('/projects/:projectId/issues', asyncHandler(async (req, res) =>
     res.json(payload);
 }));
 issuesRouter.post('/projects/:projectId/issues', asyncHandler(async (req, res) => {
-    const project = await prisma.project.findFirst({
-        where: { id: req.params.projectId, workspaceId: req.workspaceId },
-    });
-    if (!project)
-        throw new HttpError(404, 'Project not found');
+    await requireProjectAccess(req.params.projectId, req.user.id);
     const body = createIssueSchema.parse(req.body);
-    const issue = await createIssue(project.id, {
+    const fileIds = await keepAttachableFileIds(body.fileIds, req.user.id, req.workspaceId);
+    const issue = await createIssue(req.params.projectId, {
         ...body,
+        fileIds,
         reporterId: req.user.id,
         source: 'manual',
     });
-    if (req.workspaceId) {
-        invalidateCache(`workspace:${req.workspaceId}:projects`);
-        invalidateCache(`workspace:${req.workspaceId}:project:${project.id}`);
-        invalidateCache(`workspace:${req.workspaceId}:project:${project.id}:issues`);
-    }
+    await invalidateProjectCaches(req.params.projectId);
     res.status(201).json({ issue });
 }));
-// Search issues across every project in the workspace. Matches on title,
-// issue key, and keyword aliases for severity / status / type.
+// Search issues across every project the caller is a member of. Matches on
+// title, issue key, and keyword aliases for severity / status / type.
 const SEVERITY_VALUES = ['low', 'medium', 'high', 'critical'];
 const ISSUE_TYPE_VALUES = [
     'bug',
@@ -134,9 +140,7 @@ function matchStatus(q) {
     return null;
 }
 issuesRouter.get('/search/issues', asyncHandler(async (req, res) => {
-    const workspaceId = req.workspaceId;
-    if (!workspaceId)
-        throw new HttpError(400, 'No workspace');
+    const userId = req.user.id;
     const q = String(req.query.q ?? '').trim();
     if (!q) {
         res.json({ issues: [] });
@@ -157,7 +161,7 @@ issuesRouter.get('/search/issues', asyncHandler(async (req, res) => {
         or.push({ type: lower });
     }
     const issues = await prisma.issue.findMany({
-        where: { project: { workspaceId }, OR: or },
+        where: { project: { members: { some: { userId } } }, OR: or },
         orderBy: { createdAt: 'desc' },
         take: 40,
         select: {
@@ -168,14 +172,9 @@ issuesRouter.get('/search/issues', asyncHandler(async (req, res) => {
     res.json({ issues: issues.map(serializeIssue) });
 }));
 issuesRouter.get('/issues/:issueId', asyncHandler(async (req, res) => {
-    const workspaceId = req.workspaceId;
-    if (!workspaceId)
-        throw new HttpError(400, 'No workspace');
-    const issue = await remember(`workspace:${workspaceId}:issue:${req.params.issueId}`, 5_000, async () => prisma.issue.findFirst({
-        where: {
-            id: req.params.issueId,
-            project: { workspaceId },
-        },
+    await requireIssueAccess(req.params.issueId, req.user.id);
+    const issue = await remember(`issue:${req.params.issueId}:detail`, 3_000, async () => prisma.issue.findUnique({
+        where: { id: req.params.issueId },
         include: {
             ...issueDetailInclude,
             project: { select: { id: true, key: true, name: true } },
@@ -217,6 +216,7 @@ const patchSchema = z.object({
     acceptanceCriteria: z.array(z.string()).optional(),
 });
 issuesRouter.patch('/issues/:issueId', asyncHandler(async (req, res) => {
+    const { projectId } = await requireIssueAccess(req.params.issueId, req.user.id);
     const body = patchSchema.parse(req.body);
     // Scope the write to the caller's workspace (prevents cross-workspace IDOR).
     const owned = await prisma.issue.findFirst({
@@ -231,25 +231,21 @@ issuesRouter.patch('/issues/:issueId', asyncHandler(async (req, res) => {
     });
     await prisma.activityEvent.create({
         data: {
-            projectId: issue.projectId,
+            projectId,
             issueId: issue.id,
             actorId: req.user.id,
             eventType: 'issue_updated',
             payload: body,
         },
     });
-    if (req.workspaceId) {
-        invalidateCache(`workspace:${req.workspaceId}:project:${issue.projectId}:issues`);
-        invalidateCache(`workspace:${req.workspaceId}:issue:${issue.id}`);
-        invalidateCache(`issue:${issue.id}:activity`);
-        invalidateCache(`issue:${issue.id}:related`);
-    }
+    await invalidateIssueCaches(projectId, issue.id);
     res.json({ issue });
 }));
 const statusSchema = z.object({
     status: z.enum(['open', 'in_progress', 'resolved']),
 });
 issuesRouter.post('/issues/:issueId/status', asyncHandler(async (req, res) => {
+    const { projectId } = await requireIssueAccess(req.params.issueId, req.user.id);
     const { status } = statusSchema.parse(req.body);
     const issue = await prisma.issue.update({
         where: { id: req.params.issueId },
@@ -257,21 +253,14 @@ issuesRouter.post('/issues/:issueId/status', asyncHandler(async (req, res) => {
     });
     await prisma.activityEvent.create({
         data: {
-            projectId: issue.projectId,
+            projectId,
             issueId: issue.id,
             actorId: req.user.id,
             eventType: 'status_changed',
             payload: { status },
         },
     });
-    if (req.workspaceId) {
-        invalidateCache(`workspace:${req.workspaceId}:projects`);
-        invalidateCache(`workspace:${req.workspaceId}:project:${issue.projectId}`);
-        invalidateCache(`workspace:${req.workspaceId}:project:${issue.projectId}:issues`);
-        invalidateCache(`workspace:${req.workspaceId}:issue:${issue.id}`);
-        invalidateCache(`issue:${issue.id}:activity`);
-        invalidateCache(`issue:${issue.id}:related`);
-    }
+    await invalidateIssueCaches(projectId, issue.id);
     res.json({ issue });
 }));
 const commentSchema = z.object({
@@ -280,51 +269,42 @@ const commentSchema = z.object({
     fileIds: z.array(z.string().uuid()).default([]),
 });
 issuesRouter.post('/issues/:issueId/comments', asyncHandler(async (req, res) => {
-    const issue = await prisma.issue.findFirst({
-        where: { id: req.params.issueId, project: { workspaceId: req.workspaceId } },
-    });
-    if (!issue)
-        throw new HttpError(404, 'Issue not found');
+    const { projectId } = await requireIssueAccess(req.params.issueId, req.user.id);
     const { body, reviewState, fileIds } = commentSchema.parse(req.body);
+    const attachIds = await keepAttachableFileIds(fileIds, req.user.id, req.workspaceId);
     const comment = await prisma.comment.create({
         data: {
-            issueId: issue.id,
+            issueId: req.params.issueId,
             authorId: req.user.id,
             body,
             reviewState: reviewState ?? 'commented',
         },
         include: { author: { select: { id: true, name: true, avatarUrl: true } } },
     });
-    if (fileIds.length) {
+    if (attachIds.length) {
         await prisma.issueFile.createMany({
-            data: fileIds.map((fileId) => ({ issueId: issue.id, fileId })),
+            data: attachIds.map((fileId) => ({ issueId: req.params.issueId, fileId })),
             skipDuplicates: true,
         });
     }
     await prisma.activityEvent.create({
         data: {
-            projectId: issue.projectId,
-            issueId: issue.id,
+            projectId,
+            issueId: req.params.issueId,
             actorId: req.user.id,
             eventType: 'comment_added',
             payload: {
                 reviewState: reviewState ?? 'commented',
-                attachmentCount: fileIds.length,
+                attachmentCount: attachIds.length,
             },
         },
     });
-    if (req.workspaceId) {
-        invalidateCache(`workspace:${req.workspaceId}:projects`);
-        invalidateCache(`workspace:${req.workspaceId}:project:${issue.projectId}`);
-        invalidateCache(`workspace:${req.workspaceId}:project:${issue.projectId}:issues`);
-        invalidateCache(`workspace:${req.workspaceId}:issue:${issue.id}`);
-        invalidateCache(`issue:${issue.id}:activity`);
-        invalidateCache(`issue:${issue.id}:related`);
-    }
+    await invalidateIssueCaches(projectId, req.params.issueId);
     res.status(201).json({ comment });
 }));
 issuesRouter.get('/issues/:issueId/activity', asyncHandler(async (req, res) => {
-    const events = await remember(`issue:${req.params.issueId}:activity`, 5_000, async () => prisma.activityEvent.findMany({
+    await requireIssueAccess(req.params.issueId, req.user.id);
+    const events = await remember(`issue:${req.params.issueId}:activity`, 3_000, async () => prisma.activityEvent.findMany({
         where: { issueId: req.params.issueId },
         orderBy: { createdAt: 'asc' },
         include: { actor: { select: { id: true, name: true, avatarUrl: true } } },
@@ -333,6 +313,7 @@ issuesRouter.get('/issues/:issueId/activity', asyncHandler(async (req, res) => {
 }));
 // Lightweight related-issue suggestions: same labels or type, by keyword overlap.
 issuesRouter.get('/issues/:issueId/related', asyncHandler(async (req, res) => {
+    await requireIssueAccess(req.params.issueId, req.user.id);
     const related = await remember(`issue:${req.params.issueId}:related`, 5_000, async () => {
         const issue = await prisma.issue.findUnique({
             where: { id: req.params.issueId },

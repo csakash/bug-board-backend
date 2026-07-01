@@ -101,6 +101,20 @@ enum SuggestionStatus {
   dismissed
 }
 
+// Project-level roles, distinct from the workspace-level `Role`. Access to a
+// project resolves through ProjectMember, not workspace membership.
+enum ProjectRole {
+  owner
+  member
+}
+
+enum InviteStatus {
+  pending
+  accepted
+  revoked
+  expired
+}
+
 // ---------- Core ----------
 
 model User {
@@ -121,6 +135,9 @@ model User {
   chatThreads     ChatThread[]
   suggestions     IssueSuggestion[]
   activityEvents  ActivityEvent[]
+  projectMemberships ProjectMember[]
+  sentInvites     ProjectInvite[] @relation("InviteSender")
+  acceptedInvites ProjectInvite[] @relation("InviteAcceptor")
 }
 
 model Workspace {
@@ -172,9 +189,50 @@ model Project {
   suggestions IssueSuggestion[]
   relations  IssueRelation[]
   activity   ActivityEvent[]
+  members    ProjectMember[]
+  invites    ProjectInvite[]
 
   @@unique([workspaceId, key])
   @@index([workspaceId, createdAt])
+}
+
+// Per-project membership. This, not workspace membership, decides who can see
+// and act on a project. `owner` is a superset of `member`.
+model ProjectMember {
+  id        String      @id @default(uuid())
+  projectId String
+  userId    String
+  role      ProjectRole @default(member)
+  createdAt DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+// An email invitation to join a project. Opaque single-use token, locked to the
+// invited email, 7-day expiry, revocable.
+model ProjectInvite {
+  id           String       @id @default(uuid())
+  projectId    String
+  email        String // stored lower-cased
+  role         ProjectRole  @default(member)
+  token        String       @unique // crypto.randomBytes(32).base64url
+  status       InviteStatus @default(pending)
+  invitedById  String?
+  acceptedById String?
+  expiresAt    DateTime
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  invitedBy  User?   @relation("InviteSender", fields: [invitedById], references: [id])
+  acceptedBy User?   @relation("InviteAcceptor", fields: [acceptedById], references: [id])
+
+  @@index([projectId, status])
+  @@index([email])
 }
 
 model ProjectContext {
@@ -230,10 +288,10 @@ model Issue {
   files         IssueFile[]
   comments      Comment[]
   activity      ActivityEvent[]
+  chatThreads   ChatThread[]
   relationsFrom IssueRelation[] @relation("RelationSource")
   relationsTo   IssueRelation[] @relation("RelationTarget")
   fromSuggestion IssueSuggestion?
-  chatThreads    ChatThread[]
 
   @@unique([projectId, issueNumber])
   @@unique([projectId, issueKey])
@@ -335,15 +393,15 @@ model IssueFile {
 model ChatThread {
   id        String   @id @default(uuid())
   projectId String
-  issueId   String?
   userId    String?
+  issueId   String?  // set for issue-scoped chat; null for project (board) chat
   title     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   project     Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  issue       Issue?            @relation(fields: [issueId], references: [id], onDelete: Cascade)
   user        User?             @relation(fields: [userId], references: [id])
+  issue       Issue?            @relation(fields: [issueId], references: [id], onDelete: Cascade)
   messages    ChatMessage[]
   suggestions IssueSuggestion[]
 

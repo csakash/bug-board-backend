@@ -1,106 +1,351 @@
-# SPEC: Issue-scoped Bug AI sidebar (read + write actions)
+# SPEC — Project invitations, project-level membership & multi-user collaboration
+
+**Slug:** `project-invites`
+**Spans:** `backend/` (schema, auth, routes, email service) + `frontend/` (invite UI, invite landing page, polling)
+**Status:** ready to implement
+
+---
 
 ## Context
 
-The Bug AI chat is **project-scoped**. `ChatThread` carried only `projectId` + `userId`
-(`backend/prisma/schema.prisma`), the `ChatDrawer` mounted only on the board
-(`frontend/src/pages/BoardPage.tsx:157`), and the agent's context was
-`buildProjectIntel(projectId)` — project-wide counts and recent issues. Its job was
-"answer project questions + draft a NEW issue card" (`backend/src/services/gemini.ts`).
+Bug Board today is single-tenant per user. Registration creates one personal
+`Workspace` (owner) and the JWT (`bb_token`) carries exactly one `workspaceId`
+([backend/src/middleware/auth.ts:29](backend/src/middleware/auth.ts)). Every
+project/issue query filters by `req.workspaceId`, so "who can see a project" is
+identical to "who is in the workspace" — there is no way to bring a specific
+outside person into a specific project, and no notion of a project being personal
+vs shared.
 
-The individual issue view (`frontend/src/pages/IssueDetailPage.tsx`) had **no assistant**.
-A user reading a single issue could not ask the AI about that issue with it as active context.
+We want: while creating a project (and later, from Project details) the owner can
+invite people by email; the invitee gets an email from Resend; clicking it lets
+them sign up (or log in if they already have an account) and lands them directly
+on that project's board as a member; owners and members collaborate on the same
+issues with each other's changes visible within seconds. Projects with no other
+members are "personal"; inviting someone makes a project "shared."
 
-This adds an issue-scoped assistant: open an issue → a Bug AI drawer whose live context is
-that issue (its fields, its comments, and related issues). The user chats about the open
-issue, and the agent can **propose confirm-gated write actions** on it.
+Issues, comments, and the per-issue activity feed already work end to end
+([backend/src/routes/issues.ts:308](backend/src/routes/issues.ts) comments,
+`:354` activity; frontend `IssueDetailPage`). This feature does **not** rebuild
+collaboration primitives — it opens them to invited members and makes cross-user
+changes visible.
 
-## Scope (v1 — read + write, locked)
+**Decisions locked with the requester:**
+- **Access model:** new project-level membership (`ProjectMember`). Access resolves
+  per project, not per workspace.
+- **Roles:** two per project — `owner` (creator; invite/revoke members, delete
+  project, everything a member can do) and `member` (create/edit/comment/move
+  issues). No viewer role.
+- **Invites:** owner-only. Opaque token link, **locked to the invited email**,
+  **7-day expiry**, single-use, revocable. Handles both a brand-new signup and an
+  existing account.
+- **Email:** Resend Node SDK. Env `RESEND_API_KEY` + `RESEND_FROM`. Key set later;
+  when unset, log the invite link to the server console so the flow is testable.
+- **Realtime:** polling (TanStack Query `refetchInterval` ~5–10s) + shortened
+  server cache TTLs. No SSE/WebSocket infra.
+- **Personal vs shared:** implicit (personal until someone is invited). No toggle.
 
-- **Read context fed to the agent:** the open issue's own fields (title, type, status,
-  severity, priority, environment, description, steps, expected/actual, acceptance criteria,
-  labels, reporter/assignee) + **its comment thread** + **related issues** + project context
-  (`formatProjectContext`). Built by `buildIssueIntel(issueId)`.
-- **Write actions (confirm-gated):** the agent may return ONE proposed action per reply:
-  - `update_fields` — a partial patch (title/description/type/status/severity/priority/
-    environment/expected/actual/stepsToReproduce/acceptanceCriteria). Applied via the
-    existing `PATCH /api/issues/:issueId` (schema extended to accept the structured fields).
-  - `post_comment` — post the agent's text as a comment via existing
-    `POST /api/issues/:issueId/comments`.
-  Nothing is written until the user clicks **Apply changes** / **Post comment**. The drawer
-  invalidates `['issue', issueId]` + `['issues', projectId]` so the page updates immediately.
-- **Persistence:** per-issue chat threads, saved and revisitable, never mixed with board threads.
-- **UI:** reuse the board's slide-in, resizable Bug AI drawer, plus a confirm-gated action card.
+---
 
-## Out of scope
+## Current State (verified 2026-07-01)
 
-- The agent drafting a brand-new / separate issue card (that stays board-only).
-- Auto-applying changes without user confirmation.
-- Streaming responses (keeps existing request/response shape).
-- Editing the proposed action inline before applying (dismiss + re-ask instead) — later add.
+Every authenticated route derives `req.workspaceId` and scopes on it. The refactor
+must replace workspace-scoping with project-membership access checks at each site:
 
-## Data model
+| File | Route(s) | Current scoping | Change |
+|---|---|---|---|
+| `backend/src/routes/projects.ts:146` | `GET /` list | `where: { workspaceId }` | list projects where caller is a `ProjectMember` |
+| `backend/src/routes/projects.ts:198` | `POST /` create | writes `workspaceId`, `createdById` | also create owner `ProjectMember`; accept optional `invites[]` |
+| `backend/src/routes/projects.ts:250` | `GET /:id` | `findFirst … workspaceId` | `requireProjectAccess(member)` |
+| `backend/src/routes/projects.ts:287` | `PATCH /:id` | `updateMany … workspaceId` | `requireProjectAccess(owner)` |
+| `backend/src/routes/projects.ts:305` | `DELETE /:id` | `findFirst … workspaceId` | `requireProjectAccess(owner)` |
+| `backend/src/routes/projects.ts:330,345` | context get/regenerate | `workspaceId` | get→member, regenerate→owner |
+| `backend/src/routes/issues.ts:75` | `GET …/issues` | `project: { workspaceId }` | `requireProjectAccess(member)` |
+| `backend/src/routes/issues.ts:114` | `POST …/issues` | `findFirst … workspaceId` | `requireProjectAccess(member)` |
+| `backend/src/routes/issues.ts` (search, detail, PATCH, comment, activity, related) | all | `workspaceId` | member access; search spans caller's member-projects, not the workspace |
+| `backend/src/routes/chat.ts`, `uploads.ts` | all | `workspaceId` | member access on the referenced project (audit during build) |
 
-Nullable `issueId` on `ChatThread` (board threads keep `issueId = null`; issue threads set
-it). `projectId` stays required. Applied with `npm run db:push` (nullable column + index,
-non-destructive).
+Cache keys are currently `workspace:{workspaceId}:...`
+([response-cache.ts](backend/src/services/response-cache.ts) via `remember`/
+`invalidateCache`). The projects-list cache must become per-user
+(`user:{userId}:projects`); project/issue caches key by `project:{projectId}:...`.
+`invalidateCache` is in-memory per instance — on Vercel serverless it does not
+span instances, so **short TTL is the reliable cross-user freshness knob**, not
+invalidation.
+
+`config/env.ts` has no email config; `package.json` has no `resend` dependency.
+`Project.createdById` is nullable. `App.tsx` has no `/invite` route; `LoginPage`
+handles both login and register; `CreateProjectModal` posts `{name, description,
+fileIds, screenshotIds}` then navigates to the board.
+
+---
+
+## Proposed Change
+
+### 1. Data model (`backend/prisma/schema.prisma`)
 
 ```prisma
-model ChatThread {
-  // ...existing...
-  issueId String?
-  issue   Issue?  @relation(fields: [issueId], references: [id], onDelete: Cascade)
-  @@index([issueId, userId, updatedAt])
+enum ProjectRole {
+  owner
+  member
 }
-model Issue { chatThreads ChatThread[] }
+
+enum InviteStatus {
+  pending
+  accepted
+  revoked
+  expired
+}
+
+model ProjectMember {
+  id        String      @id @default(uuid())
+  projectId String
+  userId    String
+  role      ProjectRole @default(member)
+  createdAt DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+model ProjectInvite {
+  id           String       @id @default(uuid())
+  projectId    String
+  email        String                       // stored lower-cased
+  role         ProjectRole  @default(member)
+  token        String       @unique          // crypto.randomBytes(32).base64url
+  status       InviteStatus @default(pending)
+  invitedById  String?
+  acceptedById String?
+  expiresAt    DateTime
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  invitedBy  User?   @relation("InviteSender",   fields: [invitedById],  references: [id])
+  acceptedBy User?   @relation("InviteAcceptor", fields: [acceptedById], references: [id])
+
+  @@index([projectId, status])
+  @@index([email])
+}
 ```
 
-## API
+Add relations: `Project.members ProjectMember[]`, `Project.invites ProjectInvite[]`;
+`User.projectMemberships ProjectMember[]`, `User.sentInvites ProjectInvite[]
+@relation("InviteSender")`, `User.acceptedInvites ProjectInvite[]
+@relation("InviteAcceptor")`.
 
-New (issue-scoped, mirror the project endpoints):
-- `GET  /api/issues/:issueId/chat/threads` — list the user's threads for this issue; ensure one exists.
-- `POST /api/issues/:issueId/chat/threads` — start a fresh issue thread.
+### 2. Access control (`backend/src/lib/access.ts`, new)
 
-Reused / branched:
-- `GET  /api/chat/threads/:threadId/messages` — unchanged (thread-scoped, ownership-checked).
-- `POST /api/chat/threads/:threadId/messages` — **branches on `thread.issueId`**: if set, runs
-  `generateIssueAgentReply` (issue intel; `suggestion: null`, `action` may be set); else the
-  existing project agent (`action: null`). Response: `{ threadId, message, suggestion, action, title }`.
-- `PATCH /api/issues/:issueId` — schema extended with `environment`, `expectedResult`,
-  `actualResult`, `stepsToReproduce[]`, `acceptanceCriteria[]` so field-edit actions apply.
-- `POST /api/issues/:issueId/comments` — reused as-is for `post_comment`.
+```ts
+// Throws 404 if the project doesn't exist / caller isn't a member;
+// throws 403 if member but below minRole. owner satisfies any minRole.
+async function requireProjectAccess(
+  projectId: string, userId: string, minRole: ProjectRole = 'member'
+): Promise<ProjectMember>
+```
 
-Board thread queries now filter `issueId: null` so board and issue threads never mix.
+- 404 (not 403) when the caller is a non-member, so project existence isn't leaked.
+- `owner ⊇ member`: owner passes `member` checks.
+- `requireAuth` stays for identity; `req.workspaceId` remains available for the
+  "which workspace does a newly created project live in" default only.
 
-## Acceptance criteria
+### 3. Invitation endpoints
 
-1. Opening any issue shows a Bug AI drawer (slide-in, resizable), toggleable by a button.
-2. Sending a message returns an answer grounded in that issue's fields, comments, and related issues.
-3. "Improve the acceptance criteria" (or repro steps / description / severity) returns a
-   `update_fields` proposal; clicking **Apply changes** persists it and the page reflects it.
-4. "Draft a comment summarizing status" returns a `post_comment` proposal; **Post comment**
-   adds it to the issue's Activity.
-5. No change is written until the user confirms; **Dismiss** discards the proposal.
-6. Issue chat threads persist across reloads; the history switcher lists that issue's threads only.
-7. Issue threads never mix with board chat threads, and vice versa.
-8. The issue agent never emits a "draft new issue" card.
-9. Board chat is unchanged in behavior.
-10. `npm run build` clean in both `backend/` and `frontend/`. ✓
+Owner-only (via `requireProjectAccess(owner)`):
 
-## Files
+```
+POST   /api/projects                      body adds  invites?: {email:string}[]
+POST   /api/projects/:projectId/invites   { email }               -> { invite }
+GET    /api/projects/:projectId/invites                            -> { invites: [...] }  (pending only)
+DELETE /api/projects/:projectId/invites/:inviteId                  -> { ok:true }          (status=revoked)
+GET    /api/projects/:projectId/members                            -> { members: [...] }
+DELETE /api/projects/:projectId/members/:userId                    -> { ok:true }          (owner cannot remove self / last owner)
+```
+
+Public / auth-for-accept (no project membership required):
+
+```
+GET  /api/invites/:token          -> { invite: { projectName, inviterName, email, status, expired } }   (no auth)
+POST /api/invites/:token/accept   -> { projectId }   (requireAuth; caller email must equal invite.email)
+```
+
+**Create-invite rules:** lower-case + validate email; if that email is already a
+member → return `{ alreadyMember: true }` (200, no email); if a `pending` invite
+exists → refresh `expiresAt`/`token` and resend rather than duplicate; else create
+`pending` invite (`expiresAt = now + 7d`), then send email.
+
+**Accept rules:** load by token. Reject if `status != pending`, or `expiresAt < now`
+(set `status=expired`, return 410). Require the authed user's email (case-insensitive)
+== `invite.email`; else 403 `{ error, invitedEmail }`. On success: upsert
+`ProjectMember(projectId, userId, role)`, set invite `status=accepted`,
+`acceptedById=userId`. Idempotent (re-accept by an existing member is a no-op 200).
+
+### 4. Email service (`backend/src/services/email.ts`, Resend)
+
+- Add `resend` to `backend/package.json`.
+- `config/env.ts`: `email: { apiKey: optional('RESEND_API_KEY'), from:
+  optional('RESEND_FROM', 'Bug Board <onboarding@resend.dev>') }` and
+  `export const isEmailConfigured = Boolean(env.email.apiKey)`.
+- `sendProjectInvite({ to, projectName, inviterName, acceptUrl })`:
+  - `acceptUrl = \`${env.frontendUrls[0]}/invite/${token}\``.
+  - If `!isEmailConfigured`: `console.info('[invite] email disabled — link:', acceptUrl)`
+    and return (does not throw — the invite row is still created so the flow is
+    testable before the key is set).
+  - Else call Resend; on send failure, log and swallow (the invite still exists;
+    surface a non-blocking "email may not have sent" note to the owner).
+- Add `RESEND_API_KEY`, `RESEND_FROM` to `backend/.env.example`.
+
+### 5. Realtime via polling
+
+- Frontend: add `refetchInterval: 7000` + `refetchOnWindowFocus: true` to the
+  shared queries — projects list (`ProjectsPage`), board issues (`BoardPage`),
+  issue detail + comments + activity (`IssueDetailPage`).
+- Backend: lower shared-read TTLs in `remember(...)` to ~3s for issues/board/
+  activity/project detail so a warm instance doesn't hide another user's change
+  for 10s. Keep write-path `invalidateCache` calls.
+
+### 6. Frontend
+
+- **`CreateProjectModal`**: add an optional "Invite teammates" email-chips input;
+  include `invites` in the POST body. Board navigation unchanged.
+- **`ProjectDetailsModal`**: new "Members & invites" section — list members with
+  role, pending invites with a revoke (X) button, and an email input to invite.
+  Owner-only controls; members see a read-only roster.
+- **`InvitePage`** (new, route `/invite/:token` — reachable while logged out):
+  fetch invite via `GET /api/invites/:token`.
+  - invalid / expired / revoked → error card with a link to `/`.
+  - not logged in → signup form, **email prefilled and read-only** = invite email,
+    with a "Already have an account? Log in" toggle. On register/login success →
+    `POST /accept` → redirect `/projects/:projectId`.
+  - logged in as the invited email → auto-accept → redirect to the board.
+  - logged in as a different email → "This invite is for {email}. Log out and sign
+    in as {email} to accept." (email-locked; no silent cross-account accept).
+- **`App.tsx`**: register `/invite/:token` in **both** the logged-out and logged-in
+  route trees (invite links must work before auth).
+
+### 7. Migration & backfill
+
+- `npm run db:migrate` adds the two models + enums.
+- Backfill (data migration step or `prisma/seed`-style script, run once):
+  for each existing `Project` — create `ProjectMember` `owner` for `createdById`
+  (fallback: the workspace's `owner` `WorkspaceMember` when `createdById` is null),
+  and create `member` rows for every other `WorkspaceMember` of that project's
+  workspace. Preserves today's "all workspace members see all projects" behavior.
+
+### 8. Env vars (backend `.env` / `.env.example`)
+
+`RESEND_API_KEY` (set later), `RESEND_FROM` (verified sender; defaults to Resend's
+sandbox for dev). `FRONTEND_URL` already exists and is reused for the accept link.
+
+---
+
+## Acceptance Criteria
+
+1. An owner creating a project with 2 invite emails: project is created, owner is a
+   `ProjectMember(owner)`, 2 `pending` `ProjectInvite` rows exist, 2 emails are
+   sent (or 2 invite links are logged when `RESEND_API_KEY` is unset).
+2. Inviting an email that already has an account → invitee accepting is added as
+   `member` and lands on the board; **no second account is created**.
+3. Inviting a brand-new email → invitee signs up on `/invite/:token` (email locked),
+   is added as `member`, and is redirected to `/projects/:projectId`.
+4. An invite link accepted by a user whose email ≠ invite email is refused with a
+   clear message; no membership is created.
+5. An invite older than 7 days, a revoked invite, and an already-accepted invite
+   each return a distinct non-accepting state (410/gone, revoked, already-member).
+6. A non-member requesting `GET /api/projects/:id`, its issues, comments, or
+   activity gets 404; a member gets 200; only an owner can PATCH/DELETE the project,
+   invite, revoke, or remove members.
+7. A project with only its creator as member shows as personal (no other members);
+   inviting someone makes it shared. Invited users' own projects are unaffected and
+   not visible to the inviter.
+8. Two browsers on the same board: an issue created / moved / commented by user A
+   appears for user B within ~10s without a manual reload.
+9. Owner can revoke a pending invite (link stops working) and remove a member
+   (they lose access on next request); an owner cannot remove the last owner.
+10. Backfill: after migration, every pre-existing project is still visible to the
+    same users who could see it before.
+11. Type-checks + builds clean in both repos (`npm run build`). No secrets committed.
+
+---
+
+## Testing Plan
+
+| Layer | What | Count |
+|---|---|---|
+| Unit | `requireProjectAccess` (owner/member/non-member × minRole); token gen; accept email-match + expiry logic | +6 |
+| Integration | create-with-invites; invite→accept (new user); invite→accept (existing user); wrong-email refusal; expired/revoked/already-member; revoke; remove-member; non-member 404s; owner-only 403s; backfill correctness | +12 |
+| E2E | Owner invites → new user signs up via link → lands on board → both users see each other's issue/comment within poll window | +2 |
+
+---
+
+## Rollback Plan
+
+Feature is additive. Backend: revert the routes/middleware/service commits;
+`ProjectMember`/`ProjectInvite` tables can remain (unused) or be dropped via a
+down-migration. Frontend: revert; `/invite/:token` 404s harmlessly. The access
+refactor is the only non-trivial revert — keep it in one commit separate from the
+invite/email commits so it can be reverted independently. No destructive data ops.
+
+---
+
+## Effort Estimate
+
+- Schema + migration + backfill: ~2h
+- Access-control refactor across projects/issues/chat/uploads routes: ~4h
+- Invite + member endpoints: ~3h
+- Resend email service + env wiring: ~1.5h
+- Frontend (CreateProjectModal, ProjectDetailsModal, InvitePage, App routes, auth): ~5h
+- Polling + cache TTL tuning: ~1h
+- Tests: ~4h
+
+~20h total.
+
+---
+
+## Files Reference
 
 | File | Change |
-|------|--------|
-| `backend/prisma/schema.prisma` | `issueId` on `ChatThread` (relation + index); `chatThreads` on `Issue` |
-| `backend/src/services/project-intel.ts` | add `buildIssueIntel(issueId)` (fields + comments + related) |
-| `backend/src/services/gemini.ts` | add `generateIssueAgentReply()` + `IssueAction` types + sanitizers |
-| `backend/src/routes/chat.ts` | issue thread list/create; branch messages on `issueId`; scope board threads to `issueId: null` |
-| `backend/src/routes/issues.ts` | extend `patchSchema` with structured fields |
-| `frontend/src/types.ts` | `IssueFieldPatch`, `IssueChatAction` |
-| `frontend/src/components/ChatDrawer.tsx` | `issueId` prop; issue endpoints/greeting; `ActionCard` + apply/dismiss |
-| `frontend/src/pages/IssueDetailPage.tsx` | flex layout wrap, mount drawer, toggle button |
+|---|---|
+| `backend/prisma/schema.prisma` | Add `ProjectRole`, `InviteStatus`, `ProjectMember`, `ProjectInvite`; relations on `Project`/`User` |
+| `backend/src/lib/access.ts` (new) | `requireProjectAccess(projectId, userId, minRole)` |
+| `backend/src/config/env.ts:36` | Add `email` config + `isEmailConfigured` |
+| `backend/src/services/email.ts` (new) | Resend `sendProjectInvite`, dev-log fallback |
+| `backend/src/routes/projects.ts` | Owner membership on create; `invites[]`; swap workspace-scoping → access checks; per-user list cache; invite + member CRUD |
+| `backend/src/routes/invites.ts` (new) | `GET /api/invites/:token`, `POST /api/invites/:token/accept` |
+| `backend/src/routes/issues.ts`, `chat.ts`, `uploads.ts` | swap workspace-scoping → `requireProjectAccess`; shorten shared-read TTLs |
+| `backend/src/index.ts` | mount `invitesRouter` |
+| `backend/.env.example` | `RESEND_API_KEY`, `RESEND_FROM` |
+| `backend/package.json` | add `resend` |
+| `frontend/src/components/CreateProjectModal.tsx` | invite-emails input + `invites` in POST |
+| `frontend/src/components/ProjectDetailsModal.tsx` | members & invites section |
+| `frontend/src/pages/InvitePage.tsx` (new) | invite landing + signup/login + accept + redirect |
+| `frontend/src/App.tsx` | `/invite/:token` in both route trees |
+| `frontend/src/lib/auth.ts` / `api.ts` | accept-invite call; register/login returning to accept |
+| `frontend/src/pages/{BoardPage,IssueDetailPage,ProjectsPage}.tsx` | `refetchInterval` for cross-user freshness |
 
-## Rollback
+---
 
-Revert the diff in both repos. The `issueId` column is nullable and additive; board threads
-and existing data are untouched, so no data migration to undo.
+## Out of Scope
+
+- AI/agent context awareness of members (explicitly deferred by requester).
+- Live presence indicators / typing / true push (SSE/WebSocket).
+- Notifications beyond the invite email (in-app notif center, digest emails).
+- Org/team management, per-workspace billing, roles beyond owner/member.
+- Transferring project ownership UI (last-owner guard exists; transfer is later).
+
+---
+
+## Dependency Graph
+
+```
+schema + migration + backfill ─┬─> access-control refactor ─┬─> invite/member endpoints ──> frontend invite UI + InvitePage
+                               │                            └─> polling + cache TTLs
+                               └─> Resend email service ────────> (used by invite endpoints)
+```
+
+Sequencing rationale: the data model and access refactor are the foundation
+everything else calls; email and endpoints can proceed in parallel once access
+exists; frontend consumes the endpoints last.

@@ -117,8 +117,34 @@ uploadsRouter.get(
   '/:fileId/url',
   requireAuth,
   asyncHandler(async (req: AuthedRequest, res) => {
-    const file = await prisma.file.findUnique({ where: { id: req.params.fileId } });
+    const file = await prisma.file.findUnique({
+      where: { id: req.params.fileId },
+      include: {
+        projects: { select: { projectId: true } },
+        issues: { select: { issue: { select: { projectId: true } } } },
+      },
+    });
     if (!file) throw new HttpError(404, 'File not found');
+
+    // Access: the file's own workspace (uploader / not-yet-attached uploads), or
+    // membership in any project this file is attached to (project context files
+    // or issue attachments). Otherwise 404 — don't sign URLs for strangers.
+    let allowed = file.workspaceId === req.workspaceId;
+    if (!allowed) {
+      const projectIds = [
+        ...file.projects.map((p) => p.projectId),
+        ...file.issues.map((i) => i.issue.projectId),
+      ];
+      if (projectIds.length) {
+        const membership = await prisma.projectMember.findFirst({
+          where: { userId: req.user!.id, projectId: { in: projectIds } },
+          select: { id: true },
+        });
+        allowed = Boolean(membership);
+      }
+    }
+    if (!allowed) throw new HttpError(404, 'File not found');
+
     const url = await getDownloadUrl(file.objectKey);
     res.json({ url, fileName: file.fileName, contentType: file.contentType });
   }),
